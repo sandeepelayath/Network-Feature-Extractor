@@ -1,0 +1,97 @@
+# Network Feature Extractor Configuration
+
+# Network capture settings
+network:
+  interface: "eth0"  # Interface to capture traffic from
+  promiscuous: true  # Whether to put the interface in promiscuous mode
+  sampling:
+    enabled: false   # Enable sampling (true/false)
+    rate: 0.1        # Sampling rate (0.0-1.0, e.g., 0.1 = 10% of packets)
+  packet_queue_size: 100000  # Size of the packet processing queue (affects memory usage)
+  ring_buffer_size: 262144   # Size of the eBPF ring buffer in bytes (default: 256KB)
+
+# Feature extraction settings
+features:
+  basic_metrics:
+    enabled: true    # Packet counts, byte counts, flow duration
+  packet_length:
+    enabled: true    # Packet length statistics
+  timing_metrics:
+    enabled: true    # Inter-arrival time statistics
+  flag_analysis:
+    enabled: true    # TCP flag analysis
+  advanced_stats:
+    enabled: true    # Advanced statistical features
+  subflow_analysis:
+    enabled: true    # Subflow metrics
+  window_stats:
+    enabled: true    # TCP window statistics
+  active_idle:
+    enabled: true    # Active/idle time analysis
+
+# Protocol settings
+protocols:
+  tcp:
+    enabled: true
+    timeout: 300     # Flow timeout in seconds
+  udp:
+    enabled: true
+    timeout: 180
+  icmp:
+    enabled: true
+    timeout: 60
+  quic:
+    enabled: true
+    timeout: 300
+  sctp:
+    enabled: true
+    timeout: 300
+  dccp:
+    enabled: true
+    timeout: 300
+  rsvp:
+    enabled: true
+    timeout: 60
+  ipv4:
+    enabled: true
+  ipv6:
+    enabled: true
+
+# Flow tracker settings
+flow_tracker:
+  cleanup_interval: 10       # How often to check for expired flows (seconds)
+  cleanup_threshold: 10000   # Number of active flows that triggers more aggressive cleanup
+  enable_dynamic_cleanup: true # Enable dynamic cleanup based on flow count
+
+# Output settings
+output:
+  directory: "./output"       # Directory for CSV output
+  filename_prefix: "netflow"  # Prefix for output filenames
+  rotation:
+    size_limit_mb: 250        # Rotate file after reaching this size (MB)
+    time_limit_min: 30        # Rotate file after this many minutes
+  compression: 
+    enabled: true             # Enable compression of rotated files
+    algorithm: "gzip"         # Compression algorithm
+
+# Monitoring settings
+monitoring:
+  prometheus:
+    enabled: true
+    port: 5000                # Port for Prometheus metrics endpoint
+  system_stats:
+    enabled: true             # Track system resource usage
+    interval: 10              # Interval in seconds for system stats collection
+
+# Logging settings
+logging:
+  format: "json"              # Log format (json, text)
+  level: "info"               # Default log level (debug, info, warning, error, critical)
+  file: "./logs/netflow.log"  # Log file path
+  max_size_mb: 100            # Maximum log file size before rotation
+  backup_count: 5             # Number of log backups to keep
+  components:                 # Component-specific log levels
+    ebpf: "info"
+    processor: "info"
+    output: "info"
+    monitoring: "info"
