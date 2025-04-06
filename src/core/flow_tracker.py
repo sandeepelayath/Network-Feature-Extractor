@@ -10,11 +10,385 @@ from typing import Dict, List, Any, Callable, Optional
 from collections import defaultdict
 from datetime import datetime
 import copy
+from dataclasses import dataclass, field
+import structlog
+from ..logging.logger import Logger
 
 from structlog import get_logger
+import ipaddress
+import math
+import statistics
 
 # Import local modules
 from .config import Config
+from ..feature_extraction import BaseFeatureExtractor, FeatureExtractorRegistry
+from ..feature_extraction.basic_metrics import BasicMetricsExtractor
+from ..feature_extraction.packet_length import PacketLengthExtractor
+from ..feature_extraction.flag_analysis import FlagAnalysisExtractor
+from ..feature_extraction.timing_metrics import TimingMetricsExtractor
+
+# Custom exception classes
+class FlowTrackerError(Exception):
+    """Base exception for flow tracker errors."""
+    pass
+
+class FlowTrackerInitializationError(FlowTrackerError):
+    """Raised when flow tracker initialization fails."""
+    pass
+
+class FlowTrackerCleanupError(FlowTrackerError):
+    """Raised when flow tracker cleanup fails."""
+    pass
+
+class FlowTrackerStateError(FlowTrackerError):
+    """Raised when flow tracker is in an invalid state."""
+    pass
+
+class FlowTrackerValidationError(FlowTrackerError):
+    """Raised when flow validation fails."""
+    pass
+
+class FlowTrackerIOError(FlowTrackerError):
+    """Raised when I/O operations fail."""
+    pass
+
+class FlowTrackerStatsError(FlowTrackerError):
+    """Raised when statistics operations fail."""
+    pass
+
+class FlowTrackerTimeoutError(FlowTrackerError):
+    """Raised when flow operations timeout."""
+    pass
+
+class FlowTrackerResourceError(FlowTrackerError):
+    """Raised when resource limits are exceeded."""
+    pass
+
+class FlowError(Exception):
+    """Base exception for flow-related errors."""
+    pass
+
+class FlowKeyError(FlowError):
+    """Exception raised for invalid flow keys."""
+    pass
+
+class FlowUpdateError(FlowError):
+    """Exception raised for flow update errors."""
+    pass
+
+
+@dataclass(frozen=True)
+class FlowKey:
+    """Key for identifying unique flows."""
+    
+    src_ip: str
+    dst_ip: str
+    src_port: int
+    dst_port: int
+    protocol: int
+    
+    def __post_init__(self):
+        """
+        Validate flow key fields.
+        
+        Raises:
+            FlowKeyError: If flow key is invalid
+        """
+        try:
+            # Validate IP addresses
+            if not isinstance(self.src_ip, str) or not isinstance(self.dst_ip, str):
+                raise FlowKeyError("IP addresses must be strings")
+            
+            # Validate IP address format
+            try:
+                src_ip_obj = ipaddress.ip_address(self.src_ip)
+                dst_ip_obj = ipaddress.ip_address(self.dst_ip)
+            except ValueError:
+                raise FlowKeyError("Invalid IP address format")
+            
+            # Validate ports
+            if not isinstance(self.src_port, int) or not isinstance(self.dst_port, int):
+                raise FlowKeyError("Ports must be integers")
+            
+            if not (0 <= self.src_port <= 65535):
+                raise FlowKeyError("Source port must be between 0 and 65535")
+            
+            if not (0 <= self.dst_port <= 65535):
+                raise FlowKeyError("Destination port must be between 0 and 65535")
+            
+            # Validate protocol
+            if not isinstance(self.protocol, int):
+                raise FlowKeyError("Protocol must be an integer")
+            
+            if not (0 <= self.protocol <= 255):
+                raise FlowKeyError("Protocol must be between 0 and 255")
+            
+        except Exception as e:
+            raise FlowKeyError(f"Invalid flow key: {str(e)}")
+    
+    def __hash__(self) -> int:
+        """
+        Compute hash of flow key.
+        
+        Returns:
+            Hash value
+            
+        Raises:
+            FlowKeyError: If hash computation fails
+        """
+        try:
+            return hash((
+                self.src_ip,
+                self.dst_ip,
+                self.src_port,
+                self.dst_port,
+                self.protocol
+            ))
+        except Exception as e:
+            raise FlowKeyError(f"Failed to compute flow key hash: {str(e)}")
+    
+    def __eq__(self, other: object) -> bool:
+        """
+        Compare flow keys for equality.
+        
+        Args:
+            other: Other flow key
+            
+        Returns:
+            True if flow keys are equal, False otherwise
+            
+        Raises:
+            FlowKeyError: If comparison fails
+        """
+        try:
+            if not isinstance(other, FlowKey):
+                return False
+            
+            return (
+                self.src_ip == other.src_ip and
+                self.dst_ip == other.dst_ip and
+                self.src_port == other.src_port and
+                self.dst_port == other.dst_port and
+                self.protocol == other.protocol
+            )
+        except Exception as e:
+            raise FlowKeyError(f"Failed to compare flow keys: {str(e)}")
+
+
+@dataclass
+class FlowStats:
+    """Statistics for a network flow."""
+    
+    # Basic flow information
+    flow_key: FlowKey
+    start_time: float
+    end_time: float
+    duration: float
+    
+    # Packet counts and sizes
+    total_packets: int
+    total_bytes: int
+    fwd_packets: int
+    fwd_bytes: int
+    bwd_packets: int
+    bwd_bytes: int
+    
+    # Packet length statistics
+    fwd_pkt_len_max: int
+    fwd_pkt_len_min: int
+    fwd_pkt_len_mean: float
+    fwd_pkt_len_std: float
+    bwd_pkt_len_max: int
+    bwd_pkt_len_min: int
+    bwd_pkt_len_mean: float
+    bwd_pkt_len_std: float
+    
+    # Inter-arrival time statistics
+    fwd_iat_max: float
+    fwd_iat_min: float
+    fwd_iat_mean: float
+    fwd_iat_std: float
+    bwd_iat_max: float
+    bwd_iat_min: float
+    bwd_iat_mean: float
+    bwd_iat_std: float
+    
+    # Flow IAT statistics
+    flow_iat_max: float
+    flow_iat_min: float
+    flow_iat_mean: float
+    flow_iat_std: float
+    
+    # Flag counts
+    fin_count: int
+    syn_count: int
+    rst_count: int
+    psh_count: int
+    ack_count: int
+    urg_count: int
+    cwe_count: int
+    ece_count: int
+    
+    # Window sizes
+    init_win_bytes_fwd: int
+    init_win_bytes_bwd: int
+    
+    # Activity statistics
+    active_count: int
+    idle_count: int
+    active_time: float
+    idle_time: float
+    
+    def __post_init__(self):
+        """
+        Validate flow statistics.
+        
+        Raises:
+            FlowStatsError: If flow statistics are invalid
+        """
+        try:
+            # Validate basic flow information
+            if not isinstance(self.flow_key, FlowKey):
+                raise FlowStatsError("Invalid flow key")
+            
+            if not isinstance(self.start_time, (int, float)) or self.start_time <= 0:
+                raise FlowStatsError("Invalid start time")
+            
+            if not isinstance(self.end_time, (int, float)) or self.end_time <= 0:
+                raise FlowStatsError("Invalid end time")
+            
+            if not isinstance(self.duration, (int, float)) or self.duration < 0:
+                raise FlowStatsError("Invalid duration")
+            
+            # Validate packet counts and sizes
+            if not isinstance(self.total_packets, int) or self.total_packets < 0:
+                raise FlowStatsError("Invalid total packets")
+            
+            if not isinstance(self.total_bytes, int) or self.total_bytes < 0:
+                raise FlowStatsError("Invalid total bytes")
+            
+            if not isinstance(self.fwd_packets, int) or self.fwd_packets < 0:
+                raise FlowStatsError("Invalid forward packets")
+            
+            if not isinstance(self.fwd_bytes, int) or self.fwd_bytes < 0:
+                raise FlowStatsError("Invalid forward bytes")
+            
+            if not isinstance(self.bwd_packets, int) or self.bwd_packets < 0:
+                raise FlowStatsError("Invalid backward packets")
+            
+            if not isinstance(self.bwd_bytes, int) or self.bwd_bytes < 0:
+                raise FlowStatsError("Invalid backward bytes")
+            
+            # Validate packet length statistics
+            if not isinstance(self.fwd_pkt_len_max, int) or self.fwd_pkt_len_max < 0:
+                raise FlowStatsError("Invalid forward packet length maximum")
+            
+            if not isinstance(self.fwd_pkt_len_min, int) or self.fwd_pkt_len_min < 0:
+                raise FlowStatsError("Invalid forward packet length minimum")
+            
+            if not isinstance(self.fwd_pkt_len_mean, (int, float)) or self.fwd_pkt_len_mean < 0:
+                raise FlowStatsError("Invalid forward packet length mean")
+            
+            if not isinstance(self.fwd_pkt_len_std, (int, float)) or self.fwd_pkt_len_std < 0:
+                raise FlowStatsError("Invalid forward packet length standard deviation")
+            
+            if not isinstance(self.bwd_pkt_len_max, int) or self.bwd_pkt_len_max < 0:
+                raise FlowStatsError("Invalid backward packet length maximum")
+            
+            if not isinstance(self.bwd_pkt_len_min, int) or self.bwd_pkt_len_min < 0:
+                raise FlowStatsError("Invalid backward packet length minimum")
+            
+            if not isinstance(self.bwd_pkt_len_mean, (int, float)) or self.bwd_pkt_len_mean < 0:
+                raise FlowStatsError("Invalid backward packet length mean")
+            
+            if not isinstance(self.bwd_pkt_len_std, (int, float)) or self.bwd_pkt_len_std < 0:
+                raise FlowStatsError("Invalid backward packet length standard deviation")
+            
+            # Validate inter-arrival time statistics
+            if not isinstance(self.fwd_iat_max, (int, float)) or self.fwd_iat_max < 0:
+                raise FlowStatsError("Invalid forward inter-arrival time maximum")
+            
+            if not isinstance(self.fwd_iat_min, (int, float)) or self.fwd_iat_min < 0:
+                raise FlowStatsError("Invalid forward inter-arrival time minimum")
+            
+            if not isinstance(self.fwd_iat_mean, (int, float)) or self.fwd_iat_mean < 0:
+                raise FlowStatsError("Invalid forward inter-arrival time mean")
+            
+            if not isinstance(self.fwd_iat_std, (int, float)) or self.fwd_iat_std < 0:
+                raise FlowStatsError("Invalid forward inter-arrival time standard deviation")
+            
+            if not isinstance(self.bwd_iat_max, (int, float)) or self.bwd_iat_max < 0:
+                raise FlowStatsError("Invalid backward inter-arrival time maximum")
+            
+            if not isinstance(self.bwd_iat_min, (int, float)) or self.bwd_iat_min < 0:
+                raise FlowStatsError("Invalid backward inter-arrival time minimum")
+            
+            if not isinstance(self.bwd_iat_mean, (int, float)) or self.bwd_iat_mean < 0:
+                raise FlowStatsError("Invalid backward inter-arrival time mean")
+            
+            if not isinstance(self.bwd_iat_std, (int, float)) or self.bwd_iat_std < 0:
+                raise FlowStatsError("Invalid backward inter-arrival time standard deviation")
+            
+            # Validate flow IAT statistics
+            if not isinstance(self.flow_iat_max, (int, float)) or self.flow_iat_max < 0:
+                raise FlowStatsError("Invalid flow inter-arrival time maximum")
+            
+            if not isinstance(self.flow_iat_min, (int, float)) or self.flow_iat_min < 0:
+                raise FlowStatsError("Invalid flow inter-arrival time minimum")
+            
+            if not isinstance(self.flow_iat_mean, (int, float)) or self.flow_iat_mean < 0:
+                raise FlowStatsError("Invalid flow inter-arrival time mean")
+            
+            if not isinstance(self.flow_iat_std, (int, float)) or self.flow_iat_std < 0:
+                raise FlowStatsError("Invalid flow inter-arrival time standard deviation")
+            
+            # Validate flag counts
+            if not isinstance(self.fin_count, int) or self.fin_count < 0:
+                raise FlowStatsError("Invalid FIN count")
+            
+            if not isinstance(self.syn_count, int) or self.syn_count < 0:
+                raise FlowStatsError("Invalid SYN count")
+            
+            if not isinstance(self.rst_count, int) or self.rst_count < 0:
+                raise FlowStatsError("Invalid RST count")
+            
+            if not isinstance(self.psh_count, int) or self.psh_count < 0:
+                raise FlowStatsError("Invalid PSH count")
+            
+            if not isinstance(self.ack_count, int) or self.ack_count < 0:
+                raise FlowStatsError("Invalid ACK count")
+            
+            if not isinstance(self.urg_count, int) or self.urg_count < 0:
+                raise FlowStatsError("Invalid URG count")
+            
+            if not isinstance(self.cwe_count, int) or self.cwe_count < 0:
+                raise FlowStatsError("Invalid CWE count")
+            
+            if not isinstance(self.ece_count, int) or self.ece_count < 0:
+                raise FlowStatsError("Invalid ECE count")
+            
+            # Validate window sizes
+            if not isinstance(self.init_win_bytes_fwd, int) or self.init_win_bytes_fwd < 0:
+                raise FlowStatsError("Invalid forward initial window size")
+            
+            if not isinstance(self.init_win_bytes_bwd, int) or self.init_win_bytes_bwd < 0:
+                raise FlowStatsError("Invalid backward initial window size")
+            
+            # Validate activity statistics
+            if not isinstance(self.active_count, int) or self.active_count < 0:
+                raise FlowStatsError("Invalid active count")
+            
+            if not isinstance(self.idle_count, int) or self.idle_count < 0:
+                raise FlowStatsError("Invalid idle count")
+            
+            if not isinstance(self.active_time, (int, float)) or self.active_time < 0:
+                raise FlowStatsError("Invalid active time")
+            
+            if not isinstance(self.idle_time, (int, float)) or self.idle_time < 0:
+                raise FlowStatsError("Invalid idle time")
+            
+        except Exception as e:
+            raise FlowStatsError(f"Invalid flow statistics: {str(e)}")
 
 
 class Flow:
@@ -27,931 +401,1428 @@ class Flow:
     outside of FlowTracker's protected methods.
     """
     
-    def __init__(self, flow_key: Dict[str, Any], timestamp: float):
+    def __init__(self, flow_key: FlowKey, timestamp: float, activity_timeout: float):
         """
-        Initialize a new flow.
+        Initialize flow.
         
         Args:
-            flow_key: Dictionary containing flow key information
-            timestamp: Flow start timestamp
+            flow_key: Flow key
+            timestamp: Initial timestamp
+            activity_timeout: Activity timeout in seconds
+            
+        Raises:
+            FlowError: If initialization fails
+            ValueError: If parameters are invalid
         """
-        # Flow key
-        self.ip_version = flow_key["ip_version"]
-        self.protocol = flow_key["protocol"]
-        self.src_ip = flow_key["src_ip"]
-        self.dst_ip = flow_key["dst_ip"]
-        self.src_port = flow_key["src_port"]
-        self.dst_port = flow_key["dst_port"]
-        
-        # Flow timestamps
-        self.start_time = timestamp
-        self.last_update_time = timestamp
-        self.end_time = 0  # Will be set when flow completes
-        
-        # Initialize basic metrics
-        self.fwd_packets = 0
-        self.bwd_packets = 0
-        self.fwd_bytes = 0
-        self.bwd_bytes = 0
-        
-        # Packet length metrics
-        self.fwd_pkt_len_max = 0
-        self.fwd_pkt_len_min = float('inf')
-        self.fwd_pkt_len_total = 0
-        self.fwd_pkt_len_squared_sum = 0  # For standard deviation calculation
-        
-        self.bwd_pkt_len_max = 0
-        self.bwd_pkt_len_min = float('inf')
-        self.bwd_pkt_len_total = 0
-        self.bwd_pkt_len_squared_sum = 0  # For standard deviation calculation
-        
-        # Inter-arrival time metrics
-        self.flow_iat_total = 0
-        self.flow_iat_max = 0
-        self.flow_iat_min = float('inf')
-        self.flow_iat_squared_sum = 0  # For standard deviation calculation
-        self.flow_iat_count = 0
-        
-        self.fwd_iat_total = 0
-        self.fwd_iat_max = 0
-        self.fwd_iat_min = float('inf')
-        self.fwd_iat_squared_sum = 0
-        self.fwd_iat_count = 0
-        self.fwd_last_timestamp = timestamp
-        
-        self.bwd_iat_total = 0
-        self.bwd_iat_max = 0
-        self.bwd_iat_min = float('inf')
-        self.bwd_iat_squared_sum = 0
-        self.bwd_iat_count = 0
-        self.bwd_last_timestamp = timestamp
-        
-        # Flag metrics
-        self.fin_count = 0
-        self.syn_count = 0
-        self.rst_count = 0
-        self.psh_count = 0
-        self.ack_count = 0
-        self.urg_count = 0
-        self.cwe_count = 0
-        self.ece_count = 0
-        
-        # TCP window metrics
-        self.init_win_bytes_fwd = 0
-        self.init_win_bytes_bwd = 0
-        
-        # Active/idle metrics
-        self.active_time = 0
-        self.idle_time = 0
-        self.active_start = timestamp
-        self.idle_start = 0
-        self.active_count = 1  # Start in active state
-        self.idle_count = 0
-        
-        # Activity threshold (1 second by default)
-        self.activity_timeout = 1.0
-        
-        # List of raw packet data for debugging (optional)
-        self.packets = []
+        try:
+            # Validate parameters
+            if not isinstance(flow_key, FlowKey):
+                raise ValueError("Invalid flow key")
+            
+            if not isinstance(timestamp, (int, float)) or timestamp <= 0:
+                raise ValueError("Invalid timestamp")
+            
+            if not isinstance(activity_timeout, (int, float)) or activity_timeout <= 0:
+                raise ValueError("Invalid activity timeout")
+            
+            # Initialize instance variables
+            self.flow_key = flow_key
+            self.start_time = timestamp
+            self.last_update_time = timestamp
+            self.activity_timeout = activity_timeout
+            
+            # Packet counts and sizes
+            self.total_packets = 0
+            self.total_bytes = 0
+            self.fwd_packets = 0
+            self.fwd_bytes = 0
+            self.bwd_packets = 0
+            self.bwd_bytes = 0
+            
+            # Packet length statistics
+            self.fwd_pkt_len_max = 0
+            self.fwd_pkt_len_min = float('inf')
+            self.fwd_pkt_len_total = 0
+            self.fwd_pkt_len_squared_sum = 0
+            self.bwd_pkt_len_max = 0
+            self.bwd_pkt_len_min = float('inf')
+            self.bwd_pkt_len_total = 0
+            self.bwd_pkt_len_squared_sum = 0
+            
+            # Inter-arrival time statistics
+            self.fwd_iat_max = 0
+            self.fwd_iat_min = float('inf')
+            self.fwd_iat_total = 0
+            self.fwd_iat_squared_sum = 0
+            self.fwd_iat_count = 0
+            self.fwd_last_timestamp = timestamp
+            self.bwd_iat_max = 0
+            self.bwd_iat_min = float('inf')
+            self.bwd_iat_total = 0
+            self.bwd_iat_squared_sum = 0
+            self.bwd_iat_count = 0
+            self.bwd_last_timestamp = timestamp
+            
+            # Flow IAT statistics
+            self.flow_iat_max = 0
+            self.flow_iat_min = float('inf')
+            self.flow_iat_total = 0
+            self.flow_iat_squared_sum = 0
+            self.flow_iat_count = 0
+            
+            # Flag counts
+            self.fin_count = 0
+            self.syn_count = 0
+            self.rst_count = 0
+            self.psh_count = 0
+            self.ack_count = 0
+            self.urg_count = 0
+            self.cwe_count = 0
+            self.ece_count = 0
+            
+            # Window sizes
+            self.init_win_bytes_fwd = 0
+            self.init_win_bytes_bwd = 0
+            
+            # Activity statistics
+            self.active_start = timestamp
+            self.idle_start = 0
+            self.active_count = 1
+            self.idle_count = 0
+            self.active_time = 0
+            self.idle_time = 0
+            
+            # Debug information
+            self.packets = []
+            
+        except Exception as e:
+            raise FlowError(f"Failed to initialize flow: {str(e)}")
     
-    def update(self, packet: Dict[str, Any], store_packets: bool = False) -> None:
+    def _determine_direction(self, packet: Dict[str, Any]) -> str:
         """
-        Update flow with a new packet.
+        Determine packet direction.
         
         Args:
             packet: Packet metadata dictionary
-            store_packets: Whether to store raw packet data
+            
+        Returns:
+            "forward" or "backward"
+            
+        Raises:
+            FlowError: If direction cannot be determined
+            ValueError: If packet data is invalid
         """
-        timestamp = packet["timestamp"]
-        length = packet.get("length", 0)  # Use length from packet
-        direction = self._determine_direction(packet)
+        try:
+            # Validate packet data
+            if not isinstance(packet, dict):
+                raise ValueError("Packet must be a dictionary")
+            
+            required_fields = ["src_ip", "dst_ip", "src_port", "dst_port"]
+            for field in required_fields:
+                if field not in packet:
+                    raise ValueError(f"Missing required packet field: {field}")
+            
+            # Compare packet fields with flow key
+            if (packet["src_ip"] == self.flow_key.src_ip and
+                packet["src_port"] == self.flow_key.src_port and
+                packet["dst_ip"] == self.flow_key.dst_ip and
+                packet["dst_port"] == self.flow_key.dst_port):
+                return "forward"
+            elif (packet["src_ip"] == self.flow_key.dst_ip and
+                  packet["src_port"] == self.flow_key.dst_port and
+                  packet["dst_ip"] == self.flow_key.src_ip and
+                  packet["dst_port"] == self.flow_key.src_port):
+                return "backward"
+            else:
+                raise FlowError("Packet does not belong to this flow")
+                
+        except Exception as e:
+            raise FlowError(f"Failed to determine packet direction: {str(e)}")
+    
+    def get_stats(self) -> FlowStats:
+        """
+        Get flow statistics.
         
-        # Store packet for debugging if requested
-        if store_packets:
-            self.packets.append(packet)
-        
-        # Check if we need to transition from idle to active
-        if self.idle_start > 0 and timestamp - self.last_update_time > self.activity_timeout:
-            # Calculate idle time
-            idle_time = timestamp - self.idle_start
-            self.idle_time += idle_time
-            self.idle_count += 1
+        Returns:
+            Flow statistics
             
-            # Start new active period
-            self.active_start = timestamp
-            self.active_count += 1
-        
-        # Update last update time
-        prev_timestamp = self.last_update_time
-        self.last_update_time = timestamp
-        
-        # Calculate flow IAT
-        if self.flow_iat_count > 0:
-            iat = timestamp - prev_timestamp
-            self.flow_iat_total += iat
-            self.flow_iat_max = max(self.flow_iat_max, iat)
-            self.flow_iat_min = min(self.flow_iat_min, iat)
-            self.flow_iat_squared_sum += iat * iat
-        
-        self.flow_iat_count += 1
-        
-        # Update direction-specific metrics
-        if direction == "forward":
-            # Packet counts and sizes
-            self.fwd_packets += 1
-            self.fwd_bytes += length
+        Raises:
+            FlowError: If statistics cannot be computed
+        """
+        try:
+            # Compute packet length statistics
+            fwd_pkt_len_mean = (self.fwd_pkt_len_total / self.fwd_packets
+                               if self.fwd_packets > 0 else 0)
+            fwd_pkt_len_std = (math.sqrt(
+                (self.fwd_pkt_len_squared_sum / self.fwd_packets) -
+                (fwd_pkt_len_mean * fwd_pkt_len_mean)
+            ) if self.fwd_packets > 0 else 0)
             
-            # Packet length statistics
-            self.fwd_pkt_len_max = max(self.fwd_pkt_len_max, length)
-            self.fwd_pkt_len_min = min(self.fwd_pkt_len_min, length)
-            self.fwd_pkt_len_total += length
-            self.fwd_pkt_len_squared_sum += length * length
+            bwd_pkt_len_mean = (self.bwd_pkt_len_total / self.bwd_packets
+                               if self.bwd_packets > 0 else 0)
+            bwd_pkt_len_std = (math.sqrt(
+                (self.bwd_pkt_len_squared_sum / self.bwd_packets) -
+                (bwd_pkt_len_mean * bwd_pkt_len_mean)
+            ) if self.bwd_packets > 0 else 0)
             
-            # Inter-arrival time
-            if self.fwd_iat_count > 0:
-                iat = timestamp - self.fwd_last_timestamp
-                self.fwd_iat_total += iat
-                self.fwd_iat_max = max(self.fwd_iat_max, iat)
-                self.fwd_iat_min = min(self.fwd_iat_min, iat)
-                self.fwd_iat_squared_sum += iat * iat
+            # Compute inter-arrival time statistics
+            fwd_iat_mean = (self.fwd_iat_total / self.fwd_iat_count
+                           if self.fwd_iat_count > 0 else 0)
+            fwd_iat_std = (math.sqrt(
+                (self.fwd_iat_squared_sum / self.fwd_iat_count) -
+                (fwd_iat_mean * fwd_iat_mean)
+            ) if self.fwd_iat_count > 0 else 0)
             
-            self.fwd_iat_count += 1
-            self.fwd_last_timestamp = timestamp
+            bwd_iat_mean = (self.bwd_iat_total / self.bwd_iat_count
+                           if self.bwd_iat_count > 0 else 0)
+            bwd_iat_std = (math.sqrt(
+                (self.bwd_iat_squared_sum / self.bwd_iat_count) -
+                (bwd_iat_mean * bwd_iat_mean)
+            ) if self.bwd_iat_count > 0 else 0)
             
-            # Window size for first packet
-            if self.fwd_packets == 1 and "window_size" in packet:
-                self.init_win_bytes_fwd = packet["window_size"]
+            # Compute flow IAT statistics
+            flow_iat_mean = (self.flow_iat_total / self.flow_iat_count
+                            if self.flow_iat_count > 0 else 0)
+            flow_iat_std = (math.sqrt(
+                (self.flow_iat_squared_sum / self.flow_iat_count) -
+                (flow_iat_mean * flow_iat_mean)
+            ) if self.flow_iat_count > 0 else 0)
             
-        else:  # backward
-            # Packet counts and sizes
-            self.bwd_packets += 1
-            self.bwd_bytes += length
+            # Create and return flow statistics
+            return FlowStats(
+                flow_key=self.flow_key,
+                start_time=self.start_time,
+                end_time=self.last_update_time,
+                duration=self.last_update_time - self.start_time,
+                total_packets=self.total_packets,
+                total_bytes=self.total_bytes,
+                fwd_packets=self.fwd_packets,
+                fwd_bytes=self.fwd_bytes,
+                bwd_packets=self.bwd_packets,
+                bwd_bytes=self.bwd_bytes,
+                fwd_pkt_len_max=self.fwd_pkt_len_max,
+                fwd_pkt_len_min=self.fwd_pkt_len_min if self.fwd_pkt_len_min != float('inf') else 0,
+                fwd_pkt_len_mean=fwd_pkt_len_mean,
+                fwd_pkt_len_std=fwd_pkt_len_std,
+                bwd_pkt_len_max=self.bwd_pkt_len_max,
+                bwd_pkt_len_min=self.bwd_pkt_len_min if self.bwd_pkt_len_min != float('inf') else 0,
+                bwd_pkt_len_mean=bwd_pkt_len_mean,
+                bwd_pkt_len_std=bwd_pkt_len_std,
+                fwd_iat_max=self.fwd_iat_max,
+                fwd_iat_min=self.fwd_iat_min if self.fwd_iat_min != float('inf') else 0,
+                fwd_iat_mean=fwd_iat_mean,
+                fwd_iat_std=fwd_iat_std,
+                bwd_iat_max=self.bwd_iat_max,
+                bwd_iat_min=self.bwd_iat_min if self.bwd_iat_min != float('inf') else 0,
+                bwd_iat_mean=bwd_iat_mean,
+                bwd_iat_std=bwd_iat_std,
+                flow_iat_max=self.flow_iat_max,
+                flow_iat_min=self.flow_iat_min if self.flow_iat_min != float('inf') else 0,
+                flow_iat_mean=flow_iat_mean,
+                flow_iat_std=flow_iat_std,
+                fin_count=self.fin_count,
+                syn_count=self.syn_count,
+                rst_count=self.rst_count,
+                psh_count=self.psh_count,
+                ack_count=self.ack_count,
+                urg_count=self.urg_count,
+                cwe_count=self.cwe_count,
+                ece_count=self.ece_count,
+                init_win_bytes_fwd=self.init_win_bytes_fwd,
+                init_win_bytes_bwd=self.init_win_bytes_bwd,
+                active_count=self.active_count,
+                idle_count=self.idle_count,
+                active_time=self.active_time,
+                idle_time=self.idle_time
+            )
             
-            # Packet length statistics
-            self.bwd_pkt_len_max = max(self.bwd_pkt_len_max, length)
-            self.bwd_pkt_len_min = min(self.bwd_pkt_len_min, length)
-            self.bwd_pkt_len_total += length
-            self.bwd_pkt_len_squared_sum += length * length
-            
-            # Inter-arrival time
-            if self.bwd_iat_count > 0:
-                iat = timestamp - self.bwd_last_timestamp
-                self.bwd_iat_total += iat
-                self.bwd_iat_max = max(self.bwd_iat_max, iat)
-                self.bwd_iat_min = min(self.bwd_iat_min, iat)
-                self.bwd_iat_squared_sum += iat * iat
-            
-            self.bwd_iat_count += 1
-            self.bwd_last_timestamp = timestamp
-            
-            # Window size for first backward packet
-            if self.bwd_packets == 1 and "window_size" in packet:
-                self.init_win_bytes_bwd = packet["window_size"]
-        
-        # Update flag counters
-        if "flags" in packet:
-            flags = packet["flags"]
-            if flags & 0x01:
-                self.fin_count += 1
-            if flags & 0x02:
-                self.syn_count += 1
-            if flags & 0x04:
-                self.rst_count += 1
-            if flags & 0x08:
-                self.psh_count += 1
-            if flags & 0x10:
-                self.ack_count += 1
-            if flags & 0x20:
-                self.urg_count += 1
-            if flags & 0x40:
-                self.cwe_count += 1
-            if flags & 0x80:
-                self.ece_count += 1
+        except Exception as e:
+            raise FlowError(f"Failed to compute flow statistics: {str(e)}")
     
     def is_expired(self, current_time: float, timeout: float) -> bool:
         """
-        Check if the flow has expired.
+        Check if flow is expired.
         
         Args:
             current_time: Current timestamp
             timeout: Flow timeout in seconds
             
         Returns:
-            True if the flow has expired, False otherwise
+            True if flow is expired, False otherwise
+            
+        Raises:
+            FlowError: If expiration check fails
+            ValueError: If parameters are invalid
         """
-        return current_time - self.last_update_time > timeout
-    
-    def is_complete(self) -> bool:
-        """
-        Check if the flow has completed normally.
-        
-        Returns:
-            True if the flow has completed, False otherwise
-        """
-        # TCP flow termination
-        if self.protocol == 6:  # TCP
-            return self.fin_count > 0 or self.rst_count > 0
-        
-        # For other protocols, consider flow complete if it has bidirectional traffic
-        return self.fwd_packets > 0 and self.bwd_packets > 0
-    
-    def finalize(self, timestamp: float) -> None:
-        """
-        Finalize the flow for export.
-        
-        Args:
-            timestamp: Flow end timestamp
-        """
-        self.end_time = timestamp
-        
-        # Finalize active/idle times
-        if self.active_start > 0:
-            # Close the active period
-            self.active_time += timestamp - self.active_start
-        
-        # Fix min values if no packets were seen
-        if self.fwd_pkt_len_min == float('inf'):
-            self.fwd_pkt_len_min = 0
-        if self.bwd_pkt_len_min == float('inf'):
-            self.bwd_pkt_len_min = 0
-        if self.flow_iat_min == float('inf'):
-            self.flow_iat_min = 0
-        if self.fwd_iat_min == float('inf'):
-            self.fwd_iat_min = 0
-        if self.bwd_iat_min == float('inf'):
-            self.bwd_iat_min = 0
-    
-    def get_flow_key(self) -> str:
-        """
-        Get a string representation of the flow key.
-        
-        Returns:
-            Flow key string
-        """
-        return f"{self.ip_version}_{self.protocol}_{self.src_ip}_{self.dst_ip}_{self.src_port}_{self.dst_port}"
-    
-    def get_metrics(self) -> Dict[str, Any]:
-        """
-        Get all flow metrics as a dictionary.
-        
-        Returns:
-            Dictionary of flow metrics
-        """
-        total_packets = self.fwd_packets + self.bwd_packets
-        total_bytes = self.fwd_bytes + self.bwd_bytes
-        duration = self.end_time - self.start_time
-        
-        # Calculate derived metrics with numerical stability checks
-        flow_bytes_per_sec = total_bytes / max(duration, 0.001) if duration > 0 else 0
-        flow_packets_per_sec = total_packets / max(duration, 0.001) if duration > 0 else 0
-        
-        # Mean packet lengths with zero division protection
-        fwd_pkt_len_mean = self.fwd_pkt_len_total / max(self.fwd_packets, 1) if self.fwd_packets > 0 else 0
-        bwd_pkt_len_mean = self.bwd_pkt_len_total / max(self.bwd_packets, 1) if self.bwd_packets > 0 else 0
-        
-        # Standard deviations with numerically stable algorithm
-        fwd_pkt_len_std = 0
-        if self.fwd_packets > 1:
-            # Use a more numerically stable algorithm
-            variance = max(0, (self.fwd_pkt_len_squared_sum / self.fwd_packets) - (fwd_pkt_len_mean ** 2))
-            fwd_pkt_len_std = variance ** 0.5
-        
-        bwd_pkt_len_std = 0
-        if self.bwd_packets > 1:
-            # Use a more numerically stable algorithm
-            variance = max(0, (self.bwd_pkt_len_squared_sum / self.bwd_packets) - (bwd_pkt_len_mean ** 2))
-            bwd_pkt_len_std = variance ** 0.5
-        
-        # IAT means with zero division protection
-        flow_iat_count_safe = max(self.flow_iat_count, 1)
-        fwd_iat_count_safe = max(self.fwd_iat_count, 1)
-        bwd_iat_count_safe = max(self.bwd_iat_count, 1)
-        
-        flow_iat_mean = self.flow_iat_total / flow_iat_count_safe if self.flow_iat_count > 0 else 0
-        fwd_iat_mean = self.fwd_iat_total / fwd_iat_count_safe if self.fwd_iat_count > 0 else 0
-        bwd_iat_mean = self.bwd_iat_total / bwd_iat_count_safe if self.bwd_iat_count > 0 else 0
-        
-        # IAT standard deviations with numerically stable algorithm
-        flow_iat_std = 0
-        if self.flow_iat_count > 1:
-            variance = max(0, (self.flow_iat_squared_sum / flow_iat_count_safe) - (flow_iat_mean ** 2))
-            flow_iat_std = variance ** 0.5
-        
-        fwd_iat_std = 0
-        if self.fwd_iat_count > 1:
-            variance = max(0, (self.fwd_iat_squared_sum / fwd_iat_count_safe) - (fwd_iat_mean ** 2))
-            fwd_iat_std = variance ** 0.5
-        
-        bwd_iat_std = 0
-        if self.bwd_iat_count > 1:
-            variance = max(0, (self.bwd_iat_squared_sum / bwd_iat_count_safe) - (bwd_iat_mean ** 2))
-            bwd_iat_std = variance ** 0.5
-        
-        # Active/idle time statistics with zero division protection
-        active_count_safe = max(self.active_count, 1)
-        idle_count_safe = max(self.idle_count, 1)
-        
-        active_mean = self.active_time / active_count_safe if self.active_count > 0 else 0
-        active_std = 0  # We would need to track individual active periods to calculate this
-        active_max = self.active_time  # Approximation
-        active_min = self.active_time / active_count_safe if self.active_count > 0 else 0  # Approximation
-        
-        idle_mean = self.idle_time / idle_count_safe if self.idle_count > 0 else 0
-        idle_std = 0  # We would need to track individual idle periods to calculate this
-        idle_max = self.idle_time  # Approximation
-        idle_min = self.idle_time / idle_count_safe if self.idle_count > 0 else 0  # Approximation
-        
-        # Calculate packet length variance with numerical stability
-        pkt_len_variance = 0
-        if total_packets > 1:
-            pkt_len_mean = (self.fwd_pkt_len_total + self.bwd_pkt_len_total) / max(total_packets, 1)
-            pkt_len_variance = max(0, 
-                ((self.fwd_pkt_len_squared_sum + self.bwd_pkt_len_squared_sum) / max(total_packets, 1)) - 
-                (pkt_len_mean ** 2)
-            )
-        
-        # Return all metrics as a dictionary
-        return {
-            # Flow identification
-            "ip_version": self.ip_version,
-            "protocol": self.protocol,
-            "src_ip": self.src_ip,
-            "dst_ip": self.dst_ip,
-            "src_port": self.src_port,
-            "dst_port": self.dst_port,
+        try:
+            # Validate parameters
+            if not isinstance(current_time, (int, float)) or current_time <= 0:
+                raise ValueError("Invalid current time")
             
-            # Basic metrics
-            "flow_duration": duration,
-            "total_fwd_packets": self.fwd_packets,
-            "total_bwd_packets": self.bwd_packets,
-            "total_length_of_fwd_packets": self.fwd_bytes,
-            "total_length_of_bwd_packets": self.bwd_bytes,
+            if not isinstance(timeout, (int, float)) or timeout <= 0:
+                raise ValueError("Invalid timeout")
             
-            # Packet length statistics
-            "fwd_packet_length_max": self.fwd_pkt_len_max,
-            "fwd_packet_length_min": self.fwd_pkt_len_min,
-            "fwd_packet_length_mean": fwd_pkt_len_mean,
-            "fwd_packet_length_std": fwd_pkt_len_std,
-            "bwd_packet_length_max": self.bwd_pkt_len_max,
-            "bwd_packet_length_min": self.bwd_pkt_len_min,
-            "bwd_packet_length_mean": bwd_pkt_len_mean,
-            "bwd_packet_length_std": bwd_pkt_len_std,
+            # Check if flow is expired
+            return current_time - self.last_update_time > timeout
             
-            # Flow rate statistics
-            "flow_bytes_per_sec": flow_bytes_per_sec,
-            "flow_packets_per_sec": flow_packets_per_sec,
-            
-            # IAT statistics
-            "flow_iat_mean": flow_iat_mean,
-            "flow_iat_std": flow_iat_std,
-            "flow_iat_max": self.flow_iat_max,
-            "flow_iat_min": self.flow_iat_min,
-            "fwd_iat_total": self.fwd_iat_total,
-            "fwd_iat_mean": fwd_iat_mean,
-            "fwd_iat_std": fwd_iat_std,
-            "fwd_iat_max": self.fwd_iat_max,
-            "fwd_iat_min": self.fwd_iat_min,
-            "bwd_iat_total": self.bwd_iat_total,
-            "bwd_iat_mean": bwd_iat_mean,
-            "bwd_iat_std": bwd_iat_std,
-            "bwd_iat_max": self.bwd_iat_max,
-            "bwd_iat_min": self.bwd_iat_min,
-            
-            # Flag statistics
-            "fin_flag_count": self.fin_count,
-            "syn_flag_count": self.syn_count,
-            "rst_flag_count": self.rst_count,
-            "psh_flag_count": self.psh_count,
-            "ack_flag_count": self.ack_count,
-            "urg_flag_count": self.urg_count,
-            "cwe_flag_count": self.cwe_count,
-            "ece_flag_count": self.ece_count,
-            
-            # Down/up ratio with zero division protection
-            "down_up_ratio": self.bwd_bytes / max(self.fwd_bytes, 1) if self.fwd_bytes > 0 else 0,
-            
-            # Average packet size with zero division protection
-            "average_packet_size": (self.fwd_bytes + self.bwd_bytes) / max(self.fwd_packets + self.bwd_packets, 1) if (self.fwd_packets + self.bwd_packets) > 0 else 0,
-            "avg_fwd_segment_size": self.fwd_bytes / max(self.fwd_packets, 1) if self.fwd_packets > 0 else 0,
-            "avg_bwd_segment_size": self.bwd_bytes / max(self.bwd_packets, 1) if self.bwd_packets > 0 else 0,
-            
-            # Header length
-            "fwd_header_length": self.fwd_packets * 40,  # Approximation
-            
-            # Bulk statistics (simplified)
-            "fwd_avg_bytes_bulk": 0,  # Would require more detailed packet analysis
-            "fwd_avg_packets_bulk": 0,
-            "fwd_avg_bulk_rate": 0,
-            "bwd_avg_bytes_bulk": 0,
-            "bwd_avg_packets_bulk": 0,
-            "bwd_avg_bulk_rate": 0,
-            
-            # Subflow statistics
-            "subflow_fwd_packets": self.fwd_packets,
-            "subflow_fwd_bytes": self.fwd_bytes,
-            "subflow_bwd_packets": self.bwd_packets,
-            "subflow_bwd_bytes": self.bwd_bytes,
-            
-            # Init window statistics
-            "init_win_bytes_forward": self.init_win_bytes_fwd,
-            "init_win_bytes_backward": self.init_win_bytes_bwd,
-            "act_data_pkt_fwd": self.fwd_packets,
-            "min_seg_size_forward": 0,  # Would require more detailed packet analysis
-            
-            # Active/idle statistics
-            "active_mean": active_mean,
-            "active_std": active_std,
-            "active_max": active_max,
-            "active_min": active_min,
-            "idle_mean": idle_mean,
-            "idle_std": idle_std,
-            "idle_max": idle_max,
-            "idle_min": idle_min,
-            
-            # Other features
-            "packet_length_variance": pkt_len_variance,
-        }
-
-    def _determine_direction(self, packet: Dict[str, Any]) -> str:
-        """
-        Determine packet direction relative to flow.
-        
-        Args:
-            packet: Packet metadata dictionary
-            
-        Returns:
-            'forward' or 'backward'
-        """
-        if (packet["src_ip"] == self.src_ip and 
-            packet["dst_ip"] == self.dst_ip and
-            packet["src_port"] == self.src_port and
-            packet["dst_port"] == self.dst_port):
-            return "forward"
-        else:
-            return "backward"
+        except Exception as e:
+            raise FlowError(f"Failed to check flow expiration: {str(e)}")
 
 
 class FlowTracker:
-    """
-    Flow tracker for maintaining flow state and calculating metrics.
+    """Enhanced flow tracker with comprehensive error handling."""
     
-    Thread Safety:
-    This class uses RLock to ensure thread-safe access to the flow dictionary.
-    All operations that access or modify flow objects are protected by this lock.
-    External code should not access Flow objects directly, but only through
-    the methods provided by this class.
-    """
-    
-    def __init__(self, config: Config, logger_manager):
+    def __init__(self, config: Any, logger: logging.Logger):
+        """Initialize flow tracker with error handling."""
+        try:
+            self.config = config
+            self.logger = logger
+            self.flows: Dict[FlowKey, Flow] = {}
+            self.flow_stats = FlowStats()
+            self.last_cleanup = time.time()
+            self.lock = threading.Lock()
+            self.state_lock = threading.Lock()
+            self.stats_lock = threading.Lock()
+            self._is_initialized = False
+            self._is_shutting_down = False
+            self._error_count = 0
+            self._warning_count = 0
+            self._last_error_time = None
+            self._last_warning_time = None
+            self._stats = {
+                'flow_creations': 0,
+                'flow_updates': 0,
+                'flow_timeouts': 0,
+                'flow_cleanups': 0,
+                'packet_processed': 0,
+                'errors': defaultdict(int),
+                'warnings': defaultdict(int),
+                'validation_errors': defaultdict(int),
+                'io_errors': defaultdict(int),
+                'state_errors': defaultdict(int),
+                'timeout_errors': defaultdict(int),
+                'resource_errors': defaultdict(int)
+            }
+            
+            # Validate configuration
+            self._validate_config()
+            
+            # Initialize state
+            self._initialize_state()
+            
+            self.logger.info("Flow tracker initialized successfully")
+            
+        except Exception as e:
+            error_msg = f"Failed to initialize flow tracker: {str(e)}"
+            self.logger.error(error_msg)
+            raise FlowTrackerInitializationError(error_msg) from e
+
+    def _validate_config(self) -> None:
+        """Validate configuration settings."""
+        try:
+            required_settings = [
+                'flow_timeout',
+                'cleanup_interval',
+                'max_flows',
+                'max_packets_per_flow',
+                'max_bytes_per_flow'
+            ]
+            
+            for setting in required_settings:
+                if not hasattr(self.config, setting):
+                    raise FlowTrackerValidationError(f"Missing required configuration: {setting}")
+                
+                value = getattr(self.config, setting)
+                if not isinstance(value, (int, float)) or value <= 0:
+                    raise FlowTrackerValidationError(f"Invalid {setting} value: {value}")
+                
+        except FlowTrackerValidationError:
+            raise
+        except Exception as e:
+            raise FlowTrackerValidationError(f"Configuration validation failed: {str(e)}") from e
+
+    def _initialize_state(self) -> None:
+        """Initialize flow tracker state."""
+        try:
+            with self.state_lock:
+                if self._is_initialized:
+                    raise FlowTrackerStateError("Flow tracker already initialized")
+                
+                self._is_initialized = True
+                self._is_shutting_down = False
+                self._error_count = 0
+                self._warning_count = 0
+                self._last_error_time = None
+                self._last_warning_time = None
+                
+                # Initialize statistics
+                with self.stats_lock:
+                    for key in self._stats:
+                        if isinstance(self._stats[key], defaultdict):
+                            self._stats[key].clear()
+                        else:
+                            self._stats[key] = 0
+                
+        except Exception as e:
+            raise FlowTrackerStateError(f"State initialization failed: {str(e)}") from e
+
+    def _handle_error(self, error: Exception, context: str) -> None:
+        """Centralized error handling with logging and statistics."""
+        try:
+            error_type = type(error).__name__
+            error_msg = str(error)
+            
+            # Update error statistics
+            with self.stats_lock:
+                self._error_count += 1
+                self._last_error_time = time.time()
+                self._stats['errors'][error_type] += 1
+                
+                if isinstance(error, FlowTrackerValidationError):
+                    self._stats['validation_errors'][context] += 1
+                elif isinstance(error, FlowTrackerIOError):
+                    self._stats['io_errors'][context] += 1
+                elif isinstance(error, FlowTrackerStateError):
+                    self._stats['state_errors'][context] += 1
+                elif isinstance(error, FlowTrackerTimeoutError):
+                    self._stats['timeout_errors'][context] += 1
+                elif isinstance(error, FlowTrackerResourceError):
+                    self._stats['resource_errors'][context] += 1
+            
+            # Log error
+            self.logger.error(
+                f"Error in {context}: {error_msg}",
+                extra={
+                    'error_type': error_type,
+                    'context': context,
+                    'timestamp': datetime.now().isoformat()
+                }
+            )
+            
+        except Exception as e:
+            # If error handling fails, log the original error and the handling error
+            self.logger.critical(
+                f"Error handling failed for {error}: {str(e)}",
+                extra={
+                    'original_error': str(error),
+                    'handling_error': str(e),
+                    'context': context,
+                    'timestamp': datetime.now().isoformat()
+                }
+            )
+
+    def _cleanup_expired_flows(self, current_time: float) -> None:
         """
-        Initialize the flow tracker.
+        Clean up expired flows.
         
         Args:
-            config: Configuration object
-            logger_manager: Logger manager instance
+            current_time: Current time in seconds
+            
+        Raises:
+            FlowTrackerError: If cleanup fails
+            ValueError: If current time is invalid
         """
-        self.config = config
-        self.logger = logger_manager.get_logger("flow_tracker")
-        
-        # Flow storage sharding to reduce lock contention
-        self.shard_count = 16  # Number of shards (must be a power of 2)
-        self.active_flows = [{} for _ in range(self.shard_count)]
-        self.flow_locks = [threading.RLock() for _ in range(self.shard_count)]
-        
-        # Callback for completed flows
-        self.complete_flow_callback = None
-        
-        # Default timeout for flows (5 minutes)
-        self.default_timeout = 300
-        
-        # Statistics
-        self.stats = {
-            "processed_packets": 0,
-            "active_flows": 0,
-            "completed_flows": 0,
-            "expired_flows": 0,
-            "ignored_packets": 0,
-            "protocol_stats": defaultdict(int),
-            "errors": 0
-        }
-        
-        # Lock for thread-safe statistics updates
-        self.stats_lock = threading.RLock()
-        
-        # Configure cleanup settings
-        self.cleanup_interval = self.config.get('flow_tracker', 'cleanup_interval', 10)
-        self.cleanup_threshold = self.config.get('flow_tracker', 'cleanup_threshold', 10000)
-        self.enable_dynamic_cleanup = self.config.get('flow_tracker', 'enable_dynamic_cleanup', True)
-        
-        # Maximum number of active flows to track
-        self.max_flows = self.config.get('flow_tracker', 'max_flows', 1000000)
-        
-        self.cleanup_thread = None
-        self.running = True
+        try:
+            # Validate current time
+            if not isinstance(current_time, (int, float)) or current_time < 0:
+                raise ValueError("Invalid current time")
+            
+            # Get expired flows
+            try:
+                expired_flows = []
+                with self.lock:
+                    for flow_key, flow in self.flows.items():
+                        try:
+                            # Check if flow is expired
+                            if flow.is_expired(current_time):
+                                expired_flows.append(flow_key)
+                                
+                                # Finalize flow
+                                try:
+                                    flow.finalize()
+                                    
+                                except Exception as e:
+                                    self.logger.error(
+                                        f"Failed to finalize flow: {str(e)}",
+                                        flow_key=flow_key.__dict__
+                                    )
+                                    self._stats['errors'][type(e).__name__] += 1
+                                
+                                # Export flow data
+                                try:
+                                    self._export_flow(flow.get_data())
+                                    
+                                except Exception as e:
+                                    self.logger.error(
+                                        f"Failed to export flow: {str(e)}",
+                                        flow_key=flow_key.__dict__
+                                    )
+                                    self._stats['io_errors'][context] += 1
+                                
+                                # Update statistics
+                                self._stats['flow_timeouts'] += 1
+                                self._stats['active_flows'] -= 1
+                                
+                        except Exception as e:
+                            self.logger.error(
+                                f"Failed to check flow expiration: {str(e)}",
+                                flow_key=flow_key.__dict__
+                            )
+                            self._stats['errors'][type(e).__name__] += 1
+                
+            except Exception as e:
+                self.logger.error(f"Failed to get expired flows: {str(e)}")
+                self._stats['errors'][type(e).__name__] += 1
+                return
+            
+            # Remove expired flows
+            try:
+                with self.lock:
+                    for flow_key in expired_flows:
+                        try:
+                            del self.flows[flow_key]
+                            
+                        except Exception as e:
+                            self.logger.error(
+                                f"Failed to remove flow: {str(e)}",
+                                flow_key=flow_key.__dict__
+                            )
+                            self._stats['errors'][type(e).__name__] += 1
+                
+            except Exception as e:
+                self.logger.error(f"Failed to remove expired flows: {str(e)}")
+                self._stats['errors'][type(e).__name__] += 1
+            
+        except Exception as e:
+            raise FlowTrackerError(f"Failed to clean up expired flows: {str(e)}")
     
-    def start(self) -> None:
-        """Start the flow tracker."""
-        self.logger.info("Starting flow tracker", 
-                         cleanup_interval=self.cleanup_interval,
-                         cleanup_threshold=self.cleanup_threshold,
-                         dynamic_cleanup=self.enable_dynamic_cleanup)
+    def _cleanup_inactive_flows(self, current_time: float) -> None:
+        """
+        Clean up inactive flows.
         
-        # Start cleanup thread
-        self.cleanup_thread = threading.Thread(target=self._cleanup_thread_func)
-        self.cleanup_thread.daemon = True
-        self.cleanup_thread.start()
+        Args:
+            current_time: Current time in seconds
+            
+        Raises:
+            FlowTrackerError: If cleanup fails
+            ValueError: If current time is invalid
+        """
+        try:
+            # Validate current time
+            if not isinstance(current_time, (int, float)) or current_time < 0:
+                raise ValueError("Invalid current time")
+            
+            # Get inactive flows
+            try:
+                inactive_flows = []
+                with self.lock:
+                    for flow_key, flow in self.flows.items():
+                        try:
+                            # Check if flow is inactive
+                            if flow.is_inactive(current_time):
+                                inactive_flows.append(flow_key)
+                                
+                                # Finalize flow
+                                try:
+                                    flow.finalize()
+                                    
+                                except Exception as e:
+                                    self.logger.error(
+                                        f"Failed to finalize flow: {str(e)}",
+                                        flow_key=flow_key.__dict__
+                                    )
+                                    self._stats['errors'][type(e).__name__] += 1
+                                
+                                # Export flow data
+                                try:
+                                    self._export_flow(flow.get_data())
+                                    
+                                except Exception as e:
+                                    self.logger.error(
+                                        f"Failed to export flow: {str(e)}",
+                                        flow_key=flow_key.__dict__
+                                    )
+                                    self._stats['io_errors'][context] += 1
+                                
+                                # Update statistics
+                                self._stats['flow_timeouts'] += 1
+                                self._stats['active_flows'] -= 1
+                                
+                        except Exception as e:
+                            self.logger.error(
+                                f"Failed to check flow inactivity: {str(e)}",
+                                flow_key=flow_key.__dict__
+                            )
+                            self._stats['errors'][type(e).__name__] += 1
+                
+            except Exception as e:
+                self.logger.error(f"Failed to get inactive flows: {str(e)}")
+                self._stats['errors'][type(e).__name__] += 1
+                return
+            
+            # Remove inactive flows
+            try:
+                with self.lock:
+                    for flow_key in inactive_flows:
+                        try:
+                            del self.flows[flow_key]
+                            
+                        except Exception as e:
+                            self.logger.error(
+                                f"Failed to remove flow: {str(e)}",
+                                flow_key=flow_key.__dict__
+                            )
+                            self._stats['errors'][type(e).__name__] += 1
+                
+            except Exception as e:
+                self.logger.error(f"Failed to remove inactive flows: {str(e)}")
+                self._stats['errors'][type(e).__name__] += 1
+            
+        except Exception as e:
+            raise FlowTrackerError(f"Failed to clean up inactive flows: {str(e)}")
+    
+    def _cleanup_loop(self) -> None:
+        """
+        Run cleanup loop.
+        
+        Raises:
+            FlowTrackerError: If cleanup loop fails
+        """
+        try:
+            # Run cleanup loop
+            while self.running:
+                try:
+                    # Get current time
+                    try:
+                        current_time = time.time()
+                        
+                    except Exception as e:
+                        self.logger.error(f"Failed to get current time: {str(e)}")
+                        self._stats['errors'][type(e).__name__] += 1
+                        time.sleep(self.error_interval)
+                        continue
+                    
+                    # Clean up expired flows
+                    try:
+                        self._cleanup_expired_flows(current_time)
+                        
+                    except Exception as e:
+                        self.logger.error(f"Failed to clean up expired flows: {str(e)}")
+                        self._stats['errors'][type(e).__name__] += 1
+                    
+                    # Clean up inactive flows
+                    try:
+                        self._cleanup_inactive_flows(current_time)
+                        
+                    except Exception as e:
+                        self.logger.error(f"Failed to clean up inactive flows: {str(e)}")
+                        self._stats['errors'][type(e).__name__] += 1
+                    
+                    # Sleep for cleanup interval
+                    try:
+                        time.sleep(self.cleanup_interval)
+                        
+                    except Exception as e:
+                        self.logger.error(f"Failed to sleep: {str(e)}")
+                        self._stats['errors'][type(e).__name__] += 1
+                        time.sleep(self.error_interval)
+                    
+                except Exception as e:
+                    self.logger.error(f"Failed to run cleanup loop: {str(e)}")
+                    self._stats['errors'][type(e).__name__] += 1
+                    time.sleep(self.error_interval)
+            
+        except Exception as e:
+            raise FlowTrackerError(f"Failed to run cleanup loop: {str(e)}")
+    
+    def _complete_flow(self, flow_key: FlowKey) -> None:
+        """
+        Complete a flow and remove it from tracking.
+        
+        Args:
+            flow_key: Flow key
+            
+        Raises:
+            FlowTrackerError: If completion fails
+            ValueError: If flow key is invalid
+        """
+        try:
+            # Validate flow key
+            if not isinstance(flow_key, FlowKey):
+                raise ValueError("Invalid flow key")
+            
+            # Get flow
+            with self.lock:
+                if flow_key not in self.flows:
+                    self.logger.warning(f"Flow not found: {flow_key}")
+                    return
+                
+                flow = self.flows[flow_key]
+                
+                # Finalize flow
+                try:
+                    flow.finalize(time.time())
+                except Exception as e:
+                    self.logger.error(f"Failed to finalize flow: {str(e)}")
+                    self._stats['errors'][type(e).__name__] += 1
+                
+                # Remove flow
+                try:
+                    del self.flows[flow_key]
+                    self._stats['flow_cleanups'] += 1
+                except Exception as e:
+                    self.logger.error(f"Failed to remove flow: {str(e)}")
+                    self._stats['errors'][type(e).__name__] += 1
+            
+        except Exception as e:
+            raise FlowTrackerError(f"Failed to complete flow: {str(e)}")
+    
+    def _export_flow(self, flow_data: Dict[str, Any]) -> None:
+        """
+        Export flow data.
+        
+        Args:
+            flow_data: Flow data dictionary
+            
+        Raises:
+            FlowTrackerError: If export fails
+            ValueError: If flow data is invalid
+        """
+        try:
+            # Validate flow data
+            if not isinstance(flow_data, dict):
+                raise ValueError("Flow data must be a dictionary")
+            
+            required_fields = [
+                'src_ip', 'dst_ip', 'src_port', 'dst_port', 'protocol',
+                'packet_count', 'byte_count', 'duration'
+            ]
+            for field in required_fields:
+                if field not in flow_data:
+                    raise ValueError(f"Missing required flow data field: {field}")
+            
+            # Validate flow data fields
+            src_ip = flow_data["src_ip"]
+            if not isinstance(src_ip, str) or not src_ip:
+                raise ValueError("Invalid source IP address")
+            
+            dst_ip = flow_data["dst_ip"]
+            if not isinstance(dst_ip, str) or not dst_ip:
+                raise ValueError("Invalid destination IP address")
+            
+            src_port = flow_data["src_port"]
+            if not isinstance(src_port, int) or not (0 <= src_port <= 65535):
+                raise ValueError("Invalid source port")
+            
+            dst_port = flow_data["dst_port"]
+            if not isinstance(dst_port, int) or not (0 <= dst_port <= 65535):
+                raise ValueError("Invalid destination port")
+            
+            protocol = flow_data["protocol"]
+            if not isinstance(protocol, int) or not (0 <= protocol <= 255):
+                raise ValueError("Invalid protocol number")
+            
+            packet_count = flow_data["packet_count"]
+            if not isinstance(packet_count, int) or packet_count < 0:
+                raise ValueError("Invalid packet count")
+            
+            byte_count = flow_data["byte_count"]
+            if not isinstance(byte_count, int) or byte_count < 0:
+                raise ValueError("Invalid byte count")
+            
+            duration = flow_data["duration"]
+            if not isinstance(duration, (int, float)) or duration < 0:
+                raise ValueError("Invalid duration")
+            
+            # Export flow data
+            try:
+                # Log flow data
+                self.logger.info(
+                    "Flow exported",
+                    src_ip=src_ip,
+                    dst_ip=dst_ip,
+                    src_port=src_port,
+                    dst_port=dst_port,
+                    protocol=protocol,
+                    packet_count=packet_count,
+                    byte_count=byte_count,
+                    duration=duration
+                )
+                
+                # Update statistics
+                self._stats['flow_creations'] += 1
+                self._stats['packet_processed'] += packet_count
+                self._stats['total_bytes'] += byte_count
+                
+            except Exception as e:
+                self.logger.error(f"Failed to export flow: {str(e)}")
+                self._stats['errors'][type(e).__name__] += 1
+            
+        except Exception as e:
+            raise FlowTrackerError(f"Failed to export flow: {str(e)}")
     
     def process_packet(self, packet: Dict[str, Any]) -> None:
         """
-        Process a packet and update flow state.
+        Process a network packet.
         
         Args:
             packet: Packet metadata dictionary
-        """
-        # Extract flow key information
-        flow_key_dict = {
-            "ip_version": packet["ip_version"],
-            "protocol": packet["protocol"],
-            "src_ip": packet["src_ip"],
-            "dst_ip": packet["dst_ip"],
-            "src_port": packet["src_port"],
-            "dst_port": packet["dst_port"],
-        }
-        
-        # Generate a string key for the flow
-        flow_key = self._generate_flow_key(flow_key_dict)
-        
-        # Update statistics
-        with self.stats_lock:
-            self.stats["processed_packets"] += 1
-            protocol_name = self._protocol_num_to_name(packet["protocol"])
-            self.stats["protocol_stats"][protocol_name] += 1
-        
-        # Acquire lock for the entire flow processing to ensure thread safety
-        with self.flow_locks[hash(flow_key) % self.shard_count]:
-            # Check if flow exists
-            if flow_key in self.active_flows[hash(flow_key) % self.shard_count]:
-                # Update existing flow
-                flow = self.active_flows[hash(flow_key) % self.shard_count][flow_key]
-                
-                # Update flow with the packet
-                flow.update(packet)
-                
-                # Check if flow has completed
-                if flow.is_complete():
-                    # Create a deep copy of the flow metrics before releasing the lock
-                    # This ensures we don't have race conditions when exporting to CSV
-                    flow.finalize(packet["timestamp"])
-                    metrics = flow.get_metrics()  # Get metrics while holding the lock
-                    
-                    # Remove flow from active flows
-                    del self.active_flows[hash(flow_key) % self.shard_count][flow_key]
-                    
-                    # Update flow statistics
-                    with self.stats_lock:
-                        self.stats["completed_flows"] += 1
-                        self.stats["active_flows"] = len(self.active_flows)
-                    
-                    # Call callback outside the lock to avoid potential deadlocks
-                    if self.complete_flow_callback:
-                        try:
-                            # Schedule callback to run in a separate thread to avoid blocking
-                            threading.Thread(
-                                target=self._safe_callback,
-                                args=(metrics,),
-                                daemon=True
-                            ).start()
-                        except Exception as e:
-                            self.logger.error("Error scheduling flow callback", error=str(e))
-                            with self.stats_lock:
-                                self.stats["errors"] += 1
-            else:
-                # Check if we've reached the maximum flow limit
-                if len(self.active_flows) >= self.max_flows:
-                    # Force removal of oldest flow
-                    self._remove_oldest_flow()
-                    # Log warning about hitting limit
-                    self.logger.warning(
-                        "Max flow limit reached, removing oldest flow",
-                        max_flows=self.max_flows
-                    )
-                    with self.stats_lock:
-                        self.stats["dropped_flows"] = self.stats.get("dropped_flows", 0) + 1
-                
-                # Create new flow
-                flow = Flow(flow_key_dict, packet["timestamp"])
-                flow.update(packet)
-                shard_id = hash(flow_key) % self.shard_count
-                self.active_flows[shard_id][flow_key] = flow
-                
-                # We'll leave the active_flows count to be updated by get_statistics
-                # to avoid having to lock all shards for an accurate count
-    
-    def register_flow_callback(self, callback: Callable[[Dict[str, Any]], None]) -> None:
-        """
-        Register a callback function for completed flows.
-        
-        Args:
-            callback: Function to call with flow metrics dictionary
-        """
-        self.complete_flow_callback = callback
-    
-    def get_statistics(self) -> Dict[str, int]:
-        """
-        Get flow tracker statistics.
-        
-        Returns:
-            Dictionary of statistics
-        """
-        with self.stats_lock:
-            # Update active flows count
-            total_flows = 0
-            for i in range(self.shard_count):
-                with self.flow_locks[i]:
-                    total_flows += len(self.active_flows[i])
             
-            self.stats["active_flows"] = total_flows
-            # Return a copy to avoid external modifications
-            return self.stats.copy()
-    
-    def cleanup(self) -> None:
-        """Clean up resources and stop threads."""
-        self.logger.info("Cleaning up flow tracker")
-        
-        # Stop cleanup thread
-        self.running = False
-        
-        if self.cleanup_thread and self.cleanup_thread.is_alive():
-            try:
-                self.cleanup_thread.join(timeout=5.0)
-            except Exception as e:
-                self.logger.error("Error stopping cleanup thread", error=str(e))
-                
-        # Process any remaining flows
-        with self.flow_lock:
-            # Create a copy of active flows for safe iteration during cleanup
-            for flow in list(self.active_flows.values()):
-                # Finalize the flow
-                flow.finalize(time.time())
-                
-                # Export metrics if callback is registered
-                if self.complete_flow_callback:
-                    try:
-                        metrics = flow.get_metrics()
-                        self.complete_flow_callback(metrics)
-                    except Exception as e:
-                        self.logger.error("Error in flow callback during cleanup", error=str(e))
-                        with self.stats_lock:
-                            self.stats["errors"] += 1
-            
-            # Clear active flows
-            flow_count = len(self.active_flows)
-            self.active_flows.clear()
-            self.logger.info("Completed all active flows during cleanup", count=flow_count)
-            
-        self.logger.info("Flow tracker cleaned up")
-    
-    def _generate_flow_key(self, flow_dict: Dict[str, Any]) -> tuple:
-        """
-        Generate a tuple key for a flow.
-        
-        Args:
-            flow_dict: Flow key information
-            
-        Returns:
-            Flow key tuple
-        """
-        # Create a tuple that can be used as a dictionary key
-        # The order of elements is important for consistency
-        return (
-            flow_dict['ip_version'],
-            flow_dict['protocol'],
-            flow_dict['src_ip'],
-            flow_dict['dst_ip'],
-            flow_dict['src_port'],
-            flow_dict['dst_port']
-        )
-    
-    def _safe_callback(self, metrics: Dict[str, Any]) -> None:
-        """
-        Execute the flow callback safely in a separate thread.
-        
-        Args:
-            metrics: Flow metrics dictionary
+        Raises:
+            FlowTrackerError: If processing fails
+            ValueError: If packet data is invalid
         """
         try:
-            if self.complete_flow_callback:
-                # Create a deep copy of metrics to ensure immutability
-                metrics_copy = copy.deepcopy(metrics)
-                self.complete_flow_callback(metrics_copy)
+            # Validate packet data
+            if not isinstance(packet, dict):
+                raise ValueError("Packet data must be a dictionary")
+            
+            required_fields = [
+                'timestamp', 'src_ip', 'dst_ip', 'src_port', 'dst_port',
+                'protocol', 'length'
+            ]
+            for field in required_fields:
+                if field not in packet:
+                    raise ValueError(f"Missing required packet field: {field}")
+            
+            # Validate packet fields
+            timestamp = packet["timestamp"]
+            if not isinstance(timestamp, (int, float)) or timestamp < 0:
+                raise ValueError("Invalid timestamp")
+            
+            src_ip = packet["src_ip"]
+            if not isinstance(src_ip, str) or not src_ip:
+                raise ValueError("Invalid source IP address")
+            
+            dst_ip = packet["dst_ip"]
+            if not isinstance(dst_ip, str) or not dst_ip:
+                raise ValueError("Invalid destination IP address")
+            
+            src_port = packet["src_port"]
+            if not isinstance(src_port, int) or not (0 <= src_port <= 65535):
+                raise ValueError("Invalid source port")
+            
+            dst_port = packet["dst_port"]
+            if not isinstance(dst_port, int) or not (0 <= dst_port <= 65535):
+                raise ValueError("Invalid destination port")
+            
+            protocol = packet["protocol"]
+            if not isinstance(protocol, int) or not (0 <= protocol <= 255):
+                raise ValueError("Invalid protocol number")
+            
+            length = packet["length"]
+            if not isinstance(length, int) or length < 0:
+                raise ValueError("Invalid packet length")
+            
+            # Update flow tracker
+            try:
+                self.update(packet)
+                
+            except Exception as e:
+                self.logger.error(f"Failed to update flow tracker: {str(e)}")
+                self._stats['errors'][type(e).__name__] += 1
+            
         except Exception as e:
-            self.logger.error("Error in flow callback", error=str(e))
+            raise FlowTrackerError(f"Failed to process packet: {str(e)}")
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get current statistics in a thread-safe manner."""
+        try:
             with self.stats_lock:
-                self.stats["errors"] += 1
+                return {
+                    'flow_creations': self._stats['flow_creations'],
+                    'flow_updates': self._stats['flow_updates'],
+                    'flow_timeouts': self._stats['flow_timeouts'],
+                    'flow_cleanups': self._stats['flow_cleanups'],
+                    'packet_processed': self._stats['packet_processed'],
+                    'error_count': self._error_count,
+                    'warning_count': self._warning_count,
+                    'last_error_time': self._last_error_time,
+                    'last_warning_time': self._last_warning_time,
+                    'errors': dict(self._stats['errors']),
+                    'warnings': dict(self._stats['warnings']),
+                    'validation_errors': dict(self._stats['validation_errors']),
+                    'io_errors': dict(self._stats['io_errors']),
+                    'state_errors': dict(self._stats['state_errors']),
+                    'timeout_errors': dict(self._stats['timeout_errors']),
+                    'resource_errors': dict(self._stats['resource_errors'])
+                }
+        except Exception as e:
+            self._handle_error(e, "statistics retrieval")
+            return {}
     
-    def _complete_flow(self, flow: Flow) -> None:
+    def get_flow_stats(self, flow_key: FlowKey) -> Optional[FlowStats]:
         """
-        Process a completed flow and remove it from active flows.
+        Get statistics for a specific flow.
         
         Args:
-            flow: Flow object
+            flow_key: Flow key
+            
+        Returns:
+            Flow statistics if flow exists, None otherwise
+            
+        Raises:
+            FlowTrackerError: If flow statistics cannot be retrieved
+            ValueError: If flow key is invalid
         """
-        # Get flow metrics (while holding the flow_lock which is acquired by the caller)
-        metrics = flow.get_metrics()
+        try:
+            # Validate flow key
+            if not isinstance(flow_key, FlowKey):
+                raise ValueError("Invalid flow key")
+            
+            with self.lock:
+                if flow_key in self.flows:
+                    try:
+                        return self.flows[flow_key].get_stats()
+                    except Exception as e:
+                        self.logger.error(f"Failed to get flow statistics: {str(e)}")
+                        return None
+                return None
+                
+        except Exception as e:
+            raise FlowTrackerError(f"Failed to get flow statistics: {str(e)}")
+    
+    def get_all_flow_stats(self) -> List[FlowStats]:
+        """
+        Get statistics for all flows.
         
-        # Remove flow from active flows
-        flow_key = flow.get_flow_key()
-        shard_id = hash(flow_key) % self.shard_count
+        Returns:
+            List of flow statistics
+            
+        Raises:
+            FlowTrackerError: If flow statistics cannot be retrieved
+        """
+        try:
+            flow_stats = []
+            with self.lock:
+                for flow in self.flows.values():
+                    try:
+                        stats = flow.get_stats()
+                        if stats is not None:
+                            flow_stats.append(stats)
+                    except Exception as e:
+                        self.logger.error(f"Failed to get flow statistics: {str(e)}")
+                        continue
+            return flow_stats
+            
+        except Exception as e:
+            raise FlowTrackerError(f"Failed to get all flow statistics: {str(e)}")
+    
+    def get_active_flow_count(self) -> int:
+        """
+        Get active flow count.
         
-        # Flow lock should already be held by the caller
-        if flow_key in self.active_flows[shard_id]:
-            del self.active_flows[shard_id][flow_key]
-        
-        # Update statistics
-        with self.stats_lock:
-            self.stats["completed_flows"] += 1
-            self.stats["active_flows"] = len(self.active_flows)
-        
-        # Call callback if registered (in a separate thread for thread safety)
-        if self.complete_flow_callback:
+        Returns:
+            Number of active flows
+            
+        Raises:
+            FlowTrackerError: If flow count retrieval fails
+        """
+        try:
+            # Get active flow count
             try:
-                # Schedule callback to run in a separate thread to avoid blocking
-                threading.Thread(
-                    target=self._safe_callback,
-                    args=(metrics,),
-                    daemon=True
-                ).start()
+                with self.lock:
+                    return len(self.flows)
+                
             except Exception as e:
-                self.logger.error("Error scheduling flow callback", error=str(e))
-                with self.stats_lock:
-                    self.stats["errors"] += 1
-    
-    def get_protocol_timeout(self, protocol: int) -> int:
-        """
-        Get timeout for a protocol.
-        
-        Args:
-            protocol: Protocol number
+                self.logger.error(f"Failed to get active flow count: {str(e)}")
+                self._stats['errors'][type(e).__name__] += 1
+                return 0
             
-        Returns:
-            Timeout in seconds
-        """
-        protocol_name = self._protocol_num_to_name(protocol)
-        return self.config.get_protocol_timeout(protocol_name, default=self.default_timeout)
+        except Exception as e:
+            raise FlowTrackerError(f"Failed to get active flow count: {str(e)}")
     
-    def _protocol_num_to_name(self, protocol: int) -> str:
+    def get_total_flow_count(self) -> int:
         """
-        Convert protocol number to name.
+        Get total flow count.
         
-        Args:
-            protocol: Protocol number
+        Returns:
+            Number of total flows
             
-        Returns:
-            Protocol name
+        Raises:
+            FlowTrackerError: If flow count retrieval fails
         """
-        protocol_map = {
-            1: "icmp",
-            6: "tcp",
-            17: "udp",
-            33: "dccp",
-            46: "rsvp",
-            132: "sctp",
-            # Add more protocol mappings as needed
-        }
-        
-        return protocol_map.get(protocol, "unknown")
-
-    def _cleanup_flows(self) -> None:
-        """Check for expired flows and remove them."""
-        current_time = time.time()
-        expired_flows = []
-        
-        # Process each shard
-        for shard_id in range(self.shard_count):
-            with self.flow_locks[shard_id]:
-                # Create a copy of the flow dictionary items to safely iterate
-                # while potentially modifying the original dictionary during cleanup.
-                # This prevents ConcurrentModificationExceptions.
-                for flow_key, flow in list(self.active_flows[shard_id].items()):
-                    # Get timeout for the protocol
-                    protocol = flow.protocol
-                    timeout = self.get_protocol_timeout(protocol)
-                    
-                    # Check if flow has expired
-                    if flow.last_update_time + timeout < current_time:
-                        # Flow has expired
-                        flow.finalize(current_time)
-                        expired_flows.append(flow)
-                
-                # Remove expired flows and call callbacks
-                for flow in expired_flows:
-                    self._complete_flow(flow)
-                    
-                if expired_flows:
-                    self.logger.info("Cleaned up expired flows", count=len(expired_flows))
-                    with self.stats_lock:
-                        self.stats["expired_flows"] += len(expired_flows)
-                
-                # Clear expired_flows for next shard
-                expired_flows = []
-    
-    def _cleanup_thread_func(self) -> None:
-        """Thread function for periodic flow cleanup."""
-        self.logger.info("Flow cleanup thread started")
-        
-        last_cleanup_time = time.time()
-        consecutive_failures = 0
-        max_consecutive_failures = 3
-        
-        # Add a check for the running flag to allow clean termination
-        while self.running:
+        try:
+            # Get total flow count
             try:
-                # Sleep for a short interval to allow for more responsive shutdown
-                time.sleep(1.0)
+                with self.lock:
+                    return self._stats['flow_creations']
                 
-                # Exit if running flag is cleared
-                if not self.running:
-                    break
+            except Exception as e:
+                self.logger.error(f"Failed to get total flow count: {str(e)}")
+                self._stats['errors'][type(e).__name__] += 1
+                return 0
+            
+        except Exception as e:
+            raise FlowTrackerError(f"Failed to get total flow count: {str(e)}")
+    
+    def get_error_count(self) -> int:
+        """
+        Get error count.
+        
+        Returns:
+            Number of errors
+            
+        Raises:
+            FlowTrackerError: If error count retrieval fails
+        """
+        try:
+            # Get error count
+            try:
+                with self.lock:
+                    return self._stats['errors'][type(e).__name__]
                 
-                current_time = time.time()
-                time_since_cleanup = current_time - last_cleanup_time
+            except Exception as e:
+                self.logger.error(f"Failed to get error count: {str(e)}")
+                self._stats['errors'][type(e).__name__] += 1
+                return 0
+            
+        except Exception as e:
+            raise FlowTrackerError(f"Failed to get error count: {str(e)}")
+    
+    def start(self) -> None:
+        """
+        Start flow tracker.
+        
+        Raises:
+            FlowTrackerError: If flow tracker fails to start
+        """
+        try:
+            # Check if flow tracker is already running
+            if self.running:
+                self.logger.warning("Flow tracker is already running")
+                return
+            
+            # Start flow tracker
+            try:
+                # Initialize statistics
+                self._stats = {
+                    'flow_creations': 0,
+                    'flow_updates': 0,
+                    'flow_timeouts': 0,
+                    'flow_cleanups': 0,
+                    'packet_processed': 0,
+                    'errors': defaultdict(int),
+                    'warnings': defaultdict(int),
+                    'validation_errors': defaultdict(int),
+                    'io_errors': defaultdict(int),
+                    'state_errors': defaultdict(int),
+                    'timeout_errors': defaultdict(int),
+                    'resource_errors': defaultdict(int)
+                }
                 
-                # Check if it's time to clean up based on interval or high flow count
-                should_cleanup = time_since_cleanup >= self.cleanup_interval
+                # Start cleanup thread
+                self.running = True
+                self.cleanup_thread = threading.Thread(
+                    target=self._cleanup_loop,
+                    name="flow_tracker_cleanup"
+                )
+                self.cleanup_thread.daemon = True
+                self.cleanup_thread.start()
                 
-                # Dynamic cleanup: more aggressive cleanup if many active flows
-                flow_count = 0
-                for shard_id in range(self.shard_count):
-                    with self.flow_locks[shard_id]:
-                        flow_count += len(self.active_flows[shard_id])
+                # Log startup
+                self.logger.info(
+                    "Flow tracker started",
+                    max_flows=self.max_flows,
+                    activity_timeout=self.activity_timeout,
+                    cleanup_interval=self.cleanup_interval
+                )
+                
+            except Exception as e:
+                self.logger.error(f"Failed to start flow tracker: {str(e)}")
+                self._stats['errors'][type(e).__name__] += 1
+                self.running = False
+                raise FlowTrackerError(f"Failed to start flow tracker: {str(e)}")
+            
+        except Exception as e:
+            raise FlowTrackerError(f"Failed to start flow tracker: {str(e)}")
+    
+    def stop(self) -> None:
+        """
+        Stop flow tracker.
+        
+        Raises:
+            FlowTrackerError: If flow tracker fails to stop
+        """
+        try:
+            # Check if flow tracker is already stopped
+            if not self.running:
+                self.logger.warning("Flow tracker is already stopped")
+                return
+            
+            # Stop flow tracker
+            try:
+                # Stop cleanup thread
+                self.running = False
+                if self.cleanup_thread is not None:
+                    self.cleanup_thread.join(timeout=self.cleanup_interval)
+                    self.cleanup_thread = None
+                
+                # Finalize all active flows
+                with self.lock:
+                    current_time = time.time()
+                    for flow_key in list(self.flows.keys()):
+                        try:
+                            # Get flow
+                            flow = self.flows[flow_key]
+                            
+                            # Finalize flow
+                            flow.finalize()
+                            
+                            # Export flow data
+                            self._export_flow(flow.get_data())
+                            
+                            # Update statistics
+                            self._stats['flow_timeouts'] += 1
+                            self._stats['active_flows'] -= 1
+                            
+                            # Remove flow
+                            del self.flows[flow_key]
+                            
+                        except Exception as e:
+                            self.logger.error(
+                                f"Failed to finalize flow: {str(e)}",
+                                flow_key=flow_key.__dict__
+                            )
+                            self._stats['errors'][type(e).__name__] += 1
+                
+                # Log shutdown
+                self.logger.info(
+                    "Flow tracker stopped",
+                    total_flows=self._stats['flow_creations'],
+                    flow_timeouts=self._stats['flow_timeouts'],
+                    errors=self._stats['errors'][type(e).__name__]
+                )
+                
+            except Exception as e:
+                self.logger.error(f"Failed to stop flow tracker: {str(e)}")
+                self._stats['errors'][type(e).__name__] += 1
+                raise FlowTrackerError(f"Failed to stop flow tracker: {str(e)}")
+            
+        except Exception as e:
+            raise FlowTrackerError(f"Failed to stop flow tracker: {str(e)}")
+
+    def update(self, packet: Dict[str, Any]) -> None:
+        """Update flow tracker with new packet data."""
+        try:
+            # Validate packet data
+            self._validate_packet(packet)
+            
+            # Create flow key
+            flow_key = self._create_flow_key(packet)
+            
+            # Update flow
+            with self.lock:
+                if flow_key in self.flows:
+                    flow = self.flows[flow_key]
+                    try:
+                        flow.update(packet)
+                        self._update_stats('flow_updates')
+                    except Exception as e:
+                        self._handle_error(e, f"flow update for {flow_key}")
+                else:
+                    try:
+                        if len(self.flows) >= self.config.max_flows:
+                            raise FlowTrackerResourceError("Maximum number of flows reached")
                         
-                if self.enable_dynamic_cleanup and flow_count > self.cleanup_threshold:
-                    # More frequent cleanup when we have many flows
-                    should_cleanup = should_cleanup or time_since_cleanup >= (self.cleanup_interval / 2)
-                    
-                    # Log when we reach high flow counts
-                    if flow_count > self.cleanup_threshold and time_since_cleanup >= 60:
-                        self.logger.warning(
-                            "High number of active flows, increasing cleanup frequency",
-                            active_flows=flow_count,
-                            threshold=self.cleanup_threshold
+                        self.flows[flow_key] = Flow(
+                            flow_key=flow_key,
+                            timestamp=packet['timestamp'],
+                            activity_timeout=self.config.flow_timeout
                         )
-                
-                if should_cleanup:
-                    self._cleanup_flows()
-                    last_cleanup_time = current_time
-                    consecutive_failures = 0  # Reset failure counter on success
-                    
-                    # Log statistics periodically
-                    with self.stats_lock:
-                        active_flow_count = flow_count  # Reuse the count we already have
-                        completed_flow_count = self.stats["completed_flows"]
-                    
-                    self.logger.info(
-                        "Flow statistics",
-                        active_flows=active_flow_count,
-                        completed_flows=completed_flow_count
-                    )
-                    
-            except Exception as e:
-                consecutive_failures += 1
-                self.logger.error("Error in flow cleanup thread", error=str(e))
-                
-                # If too many consecutive failures, restart the thread
-                if consecutive_failures >= max_consecutive_failures:
-                    self.logger.warning(
-                        "Too many consecutive failures in cleanup thread, restarting",
-                        failures=consecutive_failures
-                    )
-                    # Reset timer to prevent immediate cleanup after restart
-                    last_cleanup_time = time.time()
-                    consecutive_failures = 0
-                
-                # Sleep to avoid tight loop in case of persistent errors
-                time.sleep(5.0)
-                
-        self.logger.info("Flow cleanup thread stopped")
-
-    def _remove_oldest_flow(self) -> None:
-        """
-        Remove the oldest flow based on last update time.
-        This method must be called with flow_lock already acquired.
-        """
-        if not self.active_flows:
-            return
+                        self.logger.error(f"Failed to update flow: {str(e)}")
+                        self._stats['errors'][type(e).__name__] += 1
+                    except Exception as e:
+                        self._handle_error(e, "flow creation")
             
-        oldest_key = None
-        oldest_time = float('inf')
+        except Exception as e:
+            raise FlowTrackerError(f"Failed to update flow tracker: {str(e)}")
+
+    def _cleanup(self) -> None:
+        """
+        Clean up expired flows.
         
-        # Find the oldest flow
-        for key, flow in self.active_flows.items():
-            if flow.last_update_time < oldest_time:
-                oldest_time = flow.last_update_time
-                oldest_key = key
+        Raises:
+            FlowTrackerError: If cleanup fails
+        """
+        try:
+            # Get current time
+            try:
+                current_time = time.time()
                 
-        # Remove the oldest flow
-        if oldest_key:
-            # Finalize metrics but don't call callback
-            flow = self.active_flows[oldest_key]
-            flow.finalize(time.time())
-            del self.active_flows[oldest_key]
+            except Exception as e:
+                self.logger.error(f"Failed to get current time: {str(e)}")
+                self._stats['errors'][type(e).__name__] += 1
+                return
+            
+            # Clean up expired flows
+            try:
+                with self.lock:
+                    expired_flows = []
+                    for flow_key, flow in self.flows.items():
+                        try:
+                            # Check if flow is expired
+                            if flow.is_expired(current_time):
+                                expired_flows.append(flow_key)
+                                
+                                # Finalize flow
+                                try:
+                                    flow.finalize()
+                                    
+                                except Exception as e:
+                                    self.logger.error(
+                                        f"Failed to finalize flow: {str(e)}",
+                                        flow_key=flow_key.__dict__
+                                    )
+                                    self._stats['errors'][type(e).__name__] += 1
+                                
+                                # Export flow data
+                                try:
+                                    self._export_flow(flow.get_data())
+                                    
+                                except Exception as e:
+                                    self.logger.error(
+                                        f"Failed to export flow: {str(e)}",
+                                        flow_key=flow_key.__dict__
+                                    )
+                                    self._stats['io_errors'][context] += 1
+                                
+                                # Update statistics
+                                self._stats['flow_timeouts'] += 1
+                                self._stats['active_flows'] -= 1
+                                
+                        except Exception as e:
+                            self.logger.error(
+                                f"Failed to check flow expiration: {str(e)}",
+                                flow_key=flow_key.__dict__
+                            )
+                            self._stats['errors'][type(e).__name__] += 1
+                    
+                    # Remove expired flows
+                    for flow_key in expired_flows:
+                        try:
+                            del self.flows[flow_key]
+                            
+                        except Exception as e:
+                            self.logger.error(
+                                f"Failed to remove flow: {str(e)}",
+                                flow_key=flow_key.__dict__
+                            )
+                            self._stats['errors'][type(e).__name__] += 1
+                
+            except Exception as e:
+                self.logger.error(f"Failed to clean up flows: {str(e)}")
+                self._stats['errors'][type(e).__name__] += 1
+            
+        except Exception as e:
+            raise FlowTrackerError(f"Failed to clean up flows: {str(e)}")
+
+    def run(self) -> None:
+        """
+        Run the flow tracker.
+        
+        Raises:
+            FlowTrackerError: If flow tracker fails to run
+        """
+        try:
+            # Start flow tracker
+            try:
+                self.start()
+                
+            except Exception as e:
+                self.logger.error(f"Failed to start flow tracker: {str(e)}")
+                self._stats['errors'][type(e).__name__] += 1
+                return
+            
+            # Run flow tracker
+            try:
+                while self.running:
+                    try:
+                        # Clean up expired flows
+                        self._cleanup()
+                        
+                        # Sleep for cleanup interval
+                        time.sleep(self.cleanup_interval)
+                        
+                    except Exception as e:
+                        self.logger.error(f"Failed to run flow tracker: {str(e)}")
+                        self._stats['errors'][type(e).__name__] += 1
+                        
+                        # Check if flow tracker should stop
+                        if not self.running:
+                            break
+                        
+                        # Sleep for error interval
+                        time.sleep(self.error_interval)
+                
+            except Exception as e:
+                self.logger.error(f"Failed to run flow tracker: {str(e)}")
+                self._stats['errors'][type(e).__name__] += 1
+            
+            # Stop flow tracker
+            try:
+                self.stop()
+                
+            except Exception as e:
+                self.logger.error(f"Failed to stop flow tracker: {str(e)}")
+                self._stats['errors'][type(e).__name__] += 1
+            
+        except Exception as e:
+            raise FlowTrackerError(f"Failed to run flow tracker: {str(e)}")
+
+    def get_flow(self, flow_key: FlowKey) -> Optional[Flow]:
+        """
+        Get flow by key.
+        
+        Args:
+            flow_key: Flow key
+            
+        Returns:
+            Flow if found, None otherwise
+            
+        Raises:
+            FlowTrackerError: If flow retrieval fails
+            ValueError: If flow key is invalid
+        """
+        try:
+            # Validate flow key
+            if not isinstance(flow_key, FlowKey):
+                raise ValueError("Invalid flow key type")
+            
+            # Get flow
+            try:
+                with self.lock:
+                    if flow_key not in self.flows:
+                        self.logger.warning(
+                            "Flow not found",
+                            flow_key=flow_key.__dict__
+                        )
+                        return None
+                    
+                    return self.flows[flow_key]
+                
+            except Exception as e:
+                self.logger.error(f"Failed to get flow: {str(e)}")
+                self._stats['errors'][type(e).__name__] += 1
+                return None
+            
+        except Exception as e:
+            raise FlowTrackerError(f"Failed to get flow: {str(e)}")
+
+    def get_flow_stats(self) -> List[Dict[str, Any]]:
+        """
+        Get flow statistics.
+        
+        Returns:
+            List of flow statistics dictionaries
+            
+        Raises:
+            FlowTrackerError: If statistics retrieval fails
+        """
+        try:
+            # Get flow statistics
+            try:
+                flow_stats = []
+                with self.lock:
+                    for flow in self.flows.values():
+                        try:
+                            # Get flow data
+                            flow_data = flow.get_data()
+                            
+                            # Add flow statistics
+                            flow_stats.append({
+                                'src_ip': flow_data['src_ip'],
+                                'dst_ip': flow_data['dst_ip'],
+                                'src_port': flow_data['src_port'],
+                                'dst_port': flow_data['dst_port'],
+                                'protocol': flow_data['protocol'],
+                                'packet_count': flow_data['packet_count'],
+                                'byte_count': flow_data['byte_count'],
+                                'duration': flow_data['duration'],
+                                'start_time': flow_data['start_time'],
+                                'end_time': flow_data['end_time'],
+                                'flags': flow_data['flags']
+                            })
+                            
+                        except Exception as e:
+                            self.logger.error(f"Failed to get flow data: {str(e)}")
+                            self._stats['errors'][type(e).__name__] += 1
+                
+                return flow_stats
+                
+            except Exception as e:
+                self.logger.error(f"Failed to get flow statistics: {str(e)}")
+                self._stats['errors'][type(e).__name__] += 1
+                return []
+            
+        except Exception as e:
+            raise FlowTrackerError(f"Failed to get flow statistics: {str(e)}")
+
+    def cleanup(self, current_time: float) -> None:
+        """Clean up expired flows."""
+        try:
+            with self.lock:
+                expired_flows = []
+                for flow_key, flow in self.flows.items():
+                    try:
+                        if flow.is_expired(current_time):
+                            expired_flows.append(flow_key)
+                            self._update_stats('flow_timeouts')
+                    except Exception as e:
+                        self._handle_error(e, f"flow expiration check for {flow_key}")
+                
+                # Remove expired flows
+                for flow_key in expired_flows:
+                    try:
+                        del self.flows[flow_key]
+                        self._update_stats('flow_cleanups')
+                    except Exception as e:
+                        self._handle_error(e, f"flow removal for {flow_key}")
+                
+                self.last_cleanup = current_time
+                
+        except Exception as e:
+            self._handle_error(e, "flow cleanup")
+
+    def get_all_flows(self) -> Dict[FlowKey, Flow]:
+        """Get all active flows."""
+        try:
+            with self.lock:
+                return self.flows.copy()
+        except Exception as e:
+            self._handle_error(e, "all flows retrieval")
+            return {}
+
+    def shutdown(self) -> None:
+        """Shutdown flow tracker."""
+        try:
+            with self.state_lock:
+                if self._is_shutting_down:
+                    return
+                
+                self._is_shutting_down = True
+                
+            # Final cleanup
+            self.cleanup(time.time())
+            
+            # Log final statistics
+            stats = self.get_stats()
+            self.logger.info(
+                "Flow tracker shutdown complete",
+                extra={
+                    'final_stats': stats,
+                    'timestamp': datetime.now().isoformat()
+                }
+            )
+            
+        except Exception as e:
+            self._handle_error(e, "flow tracker shutdown")
+            raise FlowTrackerCleanupError(f"Shutdown failed: {str(e)}") from e
+
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit."""
+        self.shutdown()

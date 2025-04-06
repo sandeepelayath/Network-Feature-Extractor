@@ -1,12 +1,22 @@
-bcc>=0.24.0
-numpy>=1.20.0
-pandas>=1.3.0
-prometheus-client>=0.14.0
-PyYAML>=6.0
+# Core dependencies
 psutil>=5.9.0
-scapy>=2.4.5
-pyroute2>=0.6.9
-gzip-reader>=0.1.4
-structlog>=21.5.0
-colorama>=0.4.4
-click>=8.1.3
+structlog>=23.1.0
+pyyaml>=6.0.1
+pandas>=2.0.0
+numpy>=1.24.0
+scikit-learn>=1.2.0
+
+# eBPF dependencies
+# bcc>=0.28.0
+
+# Monitoring dependencies
+prometheus-client>=0.16.0
+
+# Test dependencies
+pytest>=7.3.1
+pytest-cov>=4.1.0
+pytest-mock>=3.10.0
+pytest-asyncio>=0.21.0
+pytest-timeout>=2.1.0
+pytest-xdist>=3.3.1
+coverage>=7.2.5

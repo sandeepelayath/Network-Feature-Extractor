@@ -1,19 +1,236 @@
 """
 Configuration module for the Network Feature Extractor.
-Handles loading and validation of configuration from YAML files.
+Handles loading and validation of configuration from YAML files with enhanced error handling and type safety.
 """
 
 import os
 import yaml
 import threading
-from typing import Dict, Any, Optional
+import copy
+from typing import Dict, Any, Optional, TypeVar, Generic, Type
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+import logging
+from contextlib import contextmanager
+import time
 
+T = TypeVar('T')
+
+class ConfigError(Exception):
+    """Base exception for configuration errors."""
+    pass
+
+class ConfigInitializationError(ConfigError):
+    """Exception raised during configuration initialization."""
+    pass
+
+class ConfigValidationError(ConfigError):
+    """Exception raised when configuration validation fails."""
+    pass
+
+class ConfigSectionError(ConfigError):
+    """Exception raised when a configuration section is invalid."""
+    pass
+
+class ConfigValueError(ConfigError):
+    """Exception raised when a configuration value is invalid."""
+    pass
+
+class ConfigIOError(ConfigError):
+    """Exception raised during configuration I/O operations."""
+    pass
+
+class ConfigStateError(ConfigError):
+    """Exception raised during configuration state management."""
+    pass
+
+class ConfigType(Enum):
+    """Enum for configuration value types."""
+    STRING = 'string'
+    INTEGER = 'integer'
+    FLOAT = 'float'
+    BOOLEAN = 'boolean'
+    LIST = 'list'
+    DICT = 'dict'
+
+@dataclass
+class ConfigValue:
+    """Configuration value with type and validation."""
+    value: Any
+    type: ConfigType
+    required: bool = True
+    min_value: Optional[float] = None
+    max_value: Optional[float] = None
+    choices: Optional[list] = None
+    default: Any = None
+
+@dataclass
+class ConfigSection:
+    """Configuration section with validation rules."""
+    name: str
+    required: bool = True
+    values: Dict[str, ConfigValue] = field(default_factory=dict)
 
 class Config:
-    """Configuration manager for the Network Feature Extractor."""
+    """Enhanced configuration manager for the Network Feature Extractor."""
     
-    DEFAULT_CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 
-                                      'config', 'config.yaml')
+    DEFAULT_CONFIG_PATH = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+        'config',
+        'config.yaml'
+    )
+    
+    # Configuration schema
+    CONFIG_SCHEMA = {
+        'network': ConfigSection(
+            'network',
+            values={
+                'interface': ConfigValue(
+                    value=None,
+                    type=ConfigType.STRING,
+                    required=True
+                ),
+                'promiscuous': ConfigValue(
+                    value=True,
+                    type=ConfigType.BOOLEAN,
+                    required=False
+                ),
+                'mode': ConfigValue(
+                    value='xdp',
+                    type=ConfigType.STRING,
+                    required=False,
+                    choices=['xdp', 'raw_socket']
+                ),
+                'sampling': ConfigValue(
+                    value={'enabled': False, 'rate': 1.0},
+                    type=ConfigType.DICT,
+                    required=False
+                ),
+                'packet_queue_size': ConfigValue(
+                    value=100000,
+                    type=ConfigType.INTEGER,
+                    required=False,
+                    min_value=1000
+                ),
+                'ring_buffer_size': ConfigValue(
+                    value=262144,
+                    type=ConfigType.INTEGER,
+                    required=False,
+                    min_value=65536
+                ),
+                'overflow_policy': ConfigValue(
+                    value='drop',
+                    type=ConfigType.STRING,
+                    required=False,
+                    choices=['drop', 'block']
+                )
+            }
+        ),
+        'protocols': ConfigSection(
+            'protocols',
+            values={
+                'tcp': ConfigValue(
+                    value={'enabled': True, 'timeout': 300},
+                    type=ConfigType.DICT,
+                    required=False
+                ),
+                'udp': ConfigValue(
+                    value={'enabled': True, 'timeout': 180},
+                    type=ConfigType.DICT,
+                    required=False
+                ),
+                'icmp': ConfigValue(
+                    value={'enabled': True, 'timeout': 60},
+                    type=ConfigType.DICT,
+                    required=False
+                ),
+                'quic': ConfigValue(
+                    value={'enabled': True, 'timeout': 300},
+                    type=ConfigType.DICT,
+                    required=False
+                ),
+                'sctp': ConfigValue(
+                    value={'enabled': True, 'timeout': 300},
+                    type=ConfigType.DICT,
+                    required=False
+                ),
+                'dccp': ConfigValue(
+                    value={'enabled': True, 'timeout': 300},
+                    type=ConfigType.DICT,
+                    required=False
+                ),
+                'rsvp': ConfigValue(
+                    value={'enabled': True, 'timeout': 60},
+                    type=ConfigType.DICT,
+                    required=False
+                ),
+                'ipv4': ConfigValue(
+                    value={'enabled': True},
+                    type=ConfigType.DICT,
+                    required=False
+                ),
+                'ipv6': ConfigValue(
+                    value={'enabled': True},
+                    type=ConfigType.DICT,
+                    required=False
+                )
+            }
+        ),
+        'flow_tracker': ConfigSection(
+            'flow_tracker',
+            values={
+                'cleanup_interval': ConfigValue(
+                    value=10,
+                    type=ConfigType.INTEGER,
+                    required=False,
+                    min_value=1
+                ),
+                'cleanup_threshold': ConfigValue(
+                    value=10000,
+                    type=ConfigType.INTEGER,
+                    required=False,
+                    min_value=1000
+                ),
+                'enable_dynamic_cleanup': ConfigValue(
+                    value=True,
+                    type=ConfigType.BOOLEAN,
+                    required=False
+                ),
+                'max_flows': ConfigValue(
+                    value=1000000,
+                    type=ConfigType.INTEGER,
+                    required=False,
+                    min_value=1000
+                )
+            }
+        ),
+        'output': ConfigSection(
+            'output',
+            values={
+                'directory': ConfigValue(
+                    value='./output',
+                    type=ConfigType.STRING,
+                    required=True
+                ),
+                'filename_prefix': ConfigValue(
+                    value='netflow',
+                    type=ConfigType.STRING,
+                    required=False
+                ),
+                'rotation': ConfigValue(
+                    value={'size_limit_mb': 250, 'time_limit_min': 30},
+                    type=ConfigType.DICT,
+                    required=False
+                ),
+                'compression': ConfigValue(
+                    value={'enabled': True, 'algorithm': 'gzip'},
+                    type=ConfigType.DICT,
+                    required=False
+                )
+            }
+        )
+    }
     
     def __init__(self, config_path: Optional[str] = None):
         """
@@ -21,142 +238,310 @@ class Config:
         
         Args:
             config_path: Path to the configuration file. If None, uses the default path.
+            
+        Raises:
+            ConfigInitializationError: If configuration initialization fails
         """
-        self.config_path = config_path if config_path else self.DEFAULT_CONFIG_PATH
-        self.config = {}
-        self._config_lock = threading.RLock()  # Reentrant lock for thread safety
-        
-        # Local cache for frequently accessed configuration values
-        self._cache = {}
-        
-        # Default values for important configuration settings
-        self.default_values = {
-            'network': {
-                'interface': 'eth0',
-                'promiscuous': True,
-                'mode': 'xdp',
-                'sampling': {
-                    'enabled': False,
-                    'rate': 1.0
-                },
-                'packet_queue_size': 100000,
-                'ring_buffer_size': 262144,
-                'overflow_policy': 'drop'
-            },
-            'protocols': {
-                'tcp': {'enabled': True, 'timeout': 300},
-                'udp': {'enabled': True, 'timeout': 180},
-                'icmp': {'enabled': True, 'timeout': 60},
-                'quic': {'enabled': True, 'timeout': 300},
-                'sctp': {'enabled': True, 'timeout': 300},
-                'dccp': {'enabled': True, 'timeout': 300},
-                'rsvp': {'enabled': True, 'timeout': 60},
-                'ipv4': {'enabled': True},
-                'ipv6': {'enabled': True}
-            },
-            'flow_tracker': {
-                'cleanup_interval': 10,
-                'cleanup_threshold': 10000,
-                'enable_dynamic_cleanup': True,
-                'max_flows': 1000000
-            },
-            'output': {
-                'directory': './output',
-                'filename_prefix': 'netflow',
-                'rotation': {
-                    'size_limit_mb': 250,
-                    'time_limit_min': 30
-                },
-                'compression': {
-                    'enabled': True,
-                    'algorithm': 'gzip'
-                }
-            }
-        }
-        
-        # Load the configuration
-        self.load_config()
-        
-        # Initialize cache with commonly accessed values
-        self._update_cache()
-        
-    def _update_cache(self) -> None:
-        """Update the local cache with frequently accessed configuration values."""
-        with self._config_lock:
-            # Network settings
-            self._cache['network_interface'] = self.config.get('network', {}).get('interface')
-            self._cache['sampling_enabled'] = self.config.get('network', {}).get('sampling', {}).get('enabled', False)
-            self._cache['sampling_rate'] = self.config.get('network', {}).get('sampling', {}).get('rate', 1.0)
-            self._cache['packet_queue_size'] = self.config.get('network', {}).get('packet_queue_size', 100000)
-            
-            # Protocol settings - cache enabled status for common protocols
-            protocols = ['tcp', 'udp', 'icmp', 'quic', 'sctp', 'dccp', 'rsvp', 'ipv4', 'ipv6']
-            self._cache['protocol_enabled'] = {}
-            self._cache['protocol_timeout'] = {}
-            
-            for protocol in protocols:
-                self._cache['protocol_enabled'][protocol] = self.config.get('protocols', {}).get(protocol, {}).get('enabled', False)
-                self._cache['protocol_timeout'][protocol] = self.config.get('protocols', {}).get(protocol, {}).get('timeout', 300)
-            
-            # Flow tracker settings
-            self._cache['cleanup_interval'] = self.config.get('flow_tracker', {}).get('cleanup_interval', 10)
-            self._cache['cleanup_threshold'] = self.config.get('flow_tracker', {}).get('cleanup_threshold', 10000)
-            self._cache['enable_dynamic_cleanup'] = self.config.get('flow_tracker', {}).get('enable_dynamic_cleanup', True)
-            
-            # Output settings
-            self._cache['output_directory'] = self.config.get('output', {}).get('directory', './output')
-            self._cache['filename_prefix'] = self.config.get('output', {}).get('filename_prefix', 'netflow')
-        
-    def load_config(self) -> None:
-        """Load configuration from the YAML file."""
         try:
-            with open(self.config_path, 'r') as f:
-                config_data = yaml.safe_load(f)
+            self.config_path = config_path if config_path else self.DEFAULT_CONFIG_PATH
+            self.config = {}
+            self._config_lock = threading.RLock()
+            self._cache = {}
+            self.logger = logging.getLogger(__name__)
             
-            # Acquire lock before modifying the configuration
+            # Initialize state management
+            self.state_lock = threading.RLock()
+            self.initialized = False
+            self.last_update = 0
+            
+            # Statistics
+            self.stats_lock = threading.RLock()
+            self.stats = {
+                "load_attempts": 0,
+                "load_successes": 0,
+                "load_failures": 0,
+                "validation_errors": 0,
+                "io_errors": 0,
+                "state_errors": 0,
+                "cache_updates": 0,
+                "cache_hits": 0,
+                "cache_misses": 0
+            }
+            
+            # Initialize configuration
+            try:
+                self.load_config()
+                self.initialized = True
+                self.last_update = time.time()
+                self.logger.info("Configuration initialized successfully")
+            except Exception as e:
+                self._update_stats("load_failures")
+                raise ConfigInitializationError(f"Failed to initialize configuration: {str(e)}")
+            
+        except Exception as e:
+            self._handle_error(e, "initialize", "error", "load_failures")
+            raise ConfigInitializationError(f"Failed to initialize configuration: {str(e)}")
+    
+    def _validate_state(self) -> None:
+        """
+        Validate current state of the configuration.
+        
+        Raises:
+            ConfigStateError: If state validation fails
+        """
+        try:
+            with self.state_lock:
+                if not self.initialized:
+                    raise ConfigStateError("Configuration not initialized")
+                if not self.config:
+                    raise ConfigStateError("Configuration is empty")
+        except Exception as e:
+            self._update_stats("state_errors")
+            raise ConfigStateError(f"State validation failed: {str(e)}")
+    
+    def _update_state(self) -> None:
+        """
+        Update configuration state with error handling.
+        
+        Raises:
+            ConfigStateError: If state update fails
+        """
+        try:
+            with self.state_lock:
+                self.last_update = time.time()
+        except Exception as e:
+            self._update_stats("state_errors")
+            raise ConfigStateError(f"Failed to update state: {str(e)}")
+    
+    def _update_stats(self, stat_key: str, value: int = 1) -> None:
+        """
+        Update statistics with error handling.
+        
+        Args:
+            stat_key: Key of the statistic to update
+            value: Value to add to the statistic
+        """
+        try:
+            with self.stats_lock:
+                if stat_key not in self.stats:
+                    self.stats[stat_key] = 0
+                self.stats[stat_key] += value
+        except Exception as e:
+            # Don't raise here as this is used in error handling
+            pass
+    
+    def _handle_error(self, error: Exception, context: str,
+                     severity: str = "error", stat_key: str = "load_failures") -> None:
+        """
+        Handle errors with error handling.
+        
+        Args:
+            error: Exception that occurred
+            context: Context where error occurred
+            severity: Error severity ('error' or 'warning')
+            stat_key: Statistics key to update
+        """
+        try:
+            # Update statistics
+            self._update_stats(stat_key)
+            
+            # Log error
+            if severity == "error":
+                self.logger.error(f"Error in {context}: {str(error)}")
+            else:
+                self.logger.warning(f"Warning in {context}: {str(error)}")
+            
+        except Exception:
+            # Don't raise here as this is used in error handling
+            pass
+    
+    @contextmanager
+    def _config_lock_context(self):
+        """Context manager for thread-safe configuration access."""
+        try:
             with self._config_lock:
+                yield
+        except Exception as e:
+            self._handle_error(e, "config_lock", "error", "state_errors")
+            raise ConfigStateError(f"Configuration lock error: {str(e)}")
+    
+    def load_config(self) -> None:
+        """
+        Load configuration from the YAML file.
+        
+        Raises:
+            ConfigIOError: If configuration loading fails
+            ConfigValidationError: If configuration validation fails
+        """
+        try:
+            self._update_stats("load_attempts")
+            
+            if not os.path.exists(self.config_path):
+                raise FileNotFoundError(f"Configuration file not found: {self.config_path}")
+            
+            try:
+                with open(self.config_path, 'r') as f:
+                    config_data = yaml.safe_load(f)
+            except yaml.YAMLError as e:
+                self._update_stats("io_errors")
+                raise ConfigIOError(f"Error parsing configuration file: {str(e)}")
+            except Exception as e:
+                self._update_stats("io_errors")
+                raise ConfigIOError(f"Error reading configuration file: {str(e)}")
+            
+            with self._config_lock_context():
                 self.config = config_data
-                self.validate_config()
+                try:
+                    self.validate_config()
+                    self._update_cache()
+                    self._update_state()
+                    self._update_stats("load_successes")
+                except Exception as e:
+                    self._update_stats("validation_errors")
+                    raise ConfigValidationError(f"Configuration validation failed: {str(e)}")
                 
-                # Update the cache with new values
-                self._update_cache()
-        except FileNotFoundError:
-            raise FileNotFoundError(f"Configuration file not found: {self.config_path}")
-        except yaml.YAMLError as e:
-            raise ValueError(f"Error parsing configuration file: {e}")
+        except Exception as e:
+            self._handle_error(e, "load_config", "error", "load_failures")
+            raise
     
     def validate_config(self) -> None:
-        """Validate the configuration structure and values."""
-        # No need for a lock here as this is called from load_config which already has the lock
+        """
+        Validate the configuration against the schema.
         
-        # Check required sections
-        required_sections = ['network', 'features', 'protocols', 'output', 'monitoring', 'logging']
-        for section in required_sections:
-            if section not in self.config:
-                raise ValueError(f"Missing required configuration section: {section}")
+        Raises:
+            ConfigValidationError: If validation fails
+        """
+        try:
+            with self._config_lock_context():
+                # Validate required sections
+                for section_name, section in self.CONFIG_SCHEMA.items():
+                    if section.required and section_name not in self.config:
+                        raise ConfigSectionError(f"Missing required section: {section_name}")
+                    
+                    if section_name in self.config:
+                        # Validate section values
+                        for value_name, value_schema in section.values.items():
+                            if value_name in self.config[section_name]:
+                                self._validate_value(
+                                    self.config[section_name][value_name],
+                                    value_schema,
+                                    f"{section_name}.{value_name}"
+                                )
+                            elif value_schema.required:
+                                raise ConfigValueError(
+                                    f"Missing required value: {section_name}.{value_name}"
+                                )
+                            else:
+                                # Use default value if not specified
+                                self.config[section_name][value_name] = value_schema.default
+                
+        except ConfigError:
+            raise
+        except Exception as e:
+            self._update_stats("validation_errors")
+            raise ConfigValidationError(f"Configuration validation failed: {str(e)}")
+    
+    def _validate_value(self, value: Any, schema: ConfigValue, path: str) -> None:
+        """
+        Validate a configuration value against its schema.
         
-        # Validate network section
-        if 'interface' not in self.config['network']:
-            raise ValueError("Network interface must be specified")
+        Args:
+            value: Value to validate
+            schema: Value schema
+            path: Configuration path for error messages
+            
+        Raises:
+            ConfigValueError: If validation fails
+        """
+        try:
+            # Type validation
+            if schema.type == ConfigType.INTEGER:
+                if not isinstance(value, int):
+                    raise ConfigValueError(f"{path} must be an integer")
+            elif schema.type == ConfigType.FLOAT:
+                if not isinstance(value, (int, float)):
+                    raise ConfigValueError(f"{path} must be a float")
+            elif schema.type == ConfigType.BOOLEAN:
+                if not isinstance(value, bool):
+                    raise ConfigValueError(f"{path} must be a boolean")
+            elif schema.type == ConfigType.STRING:
+                if not isinstance(value, str):
+                    raise ConfigValueError(f"{path} must be a string")
+            elif schema.type == ConfigType.LIST:
+                if not isinstance(value, list):
+                    raise ConfigValueError(f"{path} must be a list")
+            elif schema.type == ConfigType.DICT:
+                if not isinstance(value, dict):
+                    raise ConfigValueError(f"{path} must be a dictionary")
+            
+            # Range validation
+            if schema.min_value is not None and value < schema.min_value:
+                raise ConfigValueError(
+                    f"{path} must be at least {schema.min_value}"
+                )
+            if schema.max_value is not None and value > schema.max_value:
+                raise ConfigValueError(
+                    f"{path} must be at most {schema.max_value}"
+                )
+            
+            # Choices validation
+            if schema.choices and value not in schema.choices:
+                raise ConfigValueError(
+                    f"{path} must be one of {schema.choices}"
+                )
+                
+        except ConfigValueError:
+            raise
+        except Exception as e:
+            self._update_stats("validation_errors")
+            raise ConfigValueError(f"Error validating {path}: {str(e)}")
+    
+    def _update_cache(self) -> None:
+        """
+        Update the configuration cache.
         
-        # Validate sampling rate if enabled
-        if self.config['network'].get('sampling', {}).get('enabled', False):
-            rate = self.config['network']['sampling'].get('rate', 0)
-            if not 0 < rate <= 1:
-                raise ValueError("Sampling rate must be between 0 and 1")
-        
-        # Validate output directory
-        output_dir = self.config['output'].get('directory')
-        if not output_dir:
-            raise ValueError("Output directory must be specified")
-        
-        # Validate rotation settings
-        size_limit = self.config['output'].get('rotation', {}).get('size_limit_mb')
-        time_limit = self.config['output'].get('rotation', {}).get('time_limit_min')
-        if size_limit is not None and size_limit <= 0:
-            raise ValueError("Rotation size limit must be positive")
-        if time_limit is not None and time_limit <= 0:
-            raise ValueError("Rotation time limit must be positive")
+        Raises:
+            ConfigStateError: If cache update fails
+        """
+        try:
+            with self._config_lock_context():
+                # Clear existing cache
+                self._cache.clear()
+                
+                # Cache network settings
+                network = self.config.get('network', {})
+                self._cache['network_interface'] = network.get('interface')
+                self._cache['sampling_enabled'] = network.get('sampling', {}).get('enabled', False)
+                self._cache['sampling_rate'] = network.get('sampling', {}).get('rate', 1.0)
+                self._cache['packet_queue_size'] = network.get('packet_queue_size', 100000)
+                
+                # Cache protocol settings
+                protocols = self.config.get('protocols', {})
+                self._cache['protocol_enabled'] = {
+                    proto: settings.get('enabled', False)
+                    for proto, settings in protocols.items()
+                }
+                self._cache['protocol_timeout'] = {
+                    proto: settings.get('timeout', 300)
+                    for proto, settings in protocols.items()
+                }
+                
+                # Cache flow tracker settings
+                flow_tracker = self.config.get('flow_tracker', {})
+                self._cache['cleanup_interval'] = flow_tracker.get('cleanup_interval', 10)
+                self._cache['cleanup_threshold'] = flow_tracker.get('cleanup_threshold', 10000)
+                self._cache['enable_dynamic_cleanup'] = flow_tracker.get('enable_dynamic_cleanup', True)
+                
+                # Cache output settings
+                output = self.config.get('output', {})
+                self._cache['output_directory'] = output.get('directory', './output')
+                self._cache['filename_prefix'] = output.get('filename_prefix', 'netflow')
+                
+                self._update_stats("cache_updates")
+                
+        except Exception as e:
+            self._handle_error(e, "update_cache", "error", "state_errors")
+            raise ConfigStateError(f"Cache update failed: {str(e)}")
     
     def get(self, section: str, key: Optional[str] = None, default: Any = None) -> Any:
         """
@@ -169,243 +554,159 @@ class Config:
             
         Returns:
             Configuration value or default
+            
+        Raises:
+            ConfigError: If the configuration is invalid
         """
-        # Check cache first for common values
-        cache_key = f"{section}_{key}" if key else section
-        if cache_key in self._cache:
-            return self._cache[cache_key]
+        try:
+            # Validate state
+            self._validate_state()
             
-        # For protocol enabled/timeout status, check the specific cache
-        if section == 'protocols' and key and key.endswith('.enabled') and key.split('.')[0] in self._cache.get('protocol_enabled', {}):
-            protocol = key.split('.')[0]
-            return self._cache['protocol_enabled'].get(protocol, default)
+            # Check cache first
+            cache_key = f"{section}_{key}" if key else section
+            if cache_key in self._cache:
+                self._update_stats("cache_hits")
+                return self._cache[cache_key]
             
-        if section == 'protocols' and key and key.endswith('.timeout') and key.split('.')[0] in self._cache.get('protocol_timeout', {}):
-            protocol = key.split('.')[0]
-            return self._cache['protocol_timeout'].get(protocol, default)
-        
-        # Determine the default value to use (in order of precedence):
-        # 1. User-provided default in this method call
-        # 2. Default from the default_values dictionary
-        # 3. None
-        resolved_default = default
-        if resolved_default is None and section in self.default_values:
-            if key is None:
-                resolved_default = self.default_values[section]
-            elif key in self.default_values[section]:
-                resolved_default = self.default_values[section][key]
-            elif '.' in key:  # Handle nested keys like 'sampling.rate'
-                parts = key.split('.')
-                value = self.default_values.get(section)
-                for part in parts:
-                    if value and isinstance(value, dict) and part in value:
-                        value = value[part]
-                    else:
-                        value = None
-                        break
-                resolved_default = value
-        
-        # Fall back to configuration lookup with lock
-        with self._config_lock:
-            if section not in self.config:
-                return resolved_default
+            self._update_stats("cache_misses")
             
-            if key is None:
-                # Return a deep copy to prevent modifications
-                import copy
-                return copy.deepcopy(self.config[section])
-            
-            value = None
-            if key in self.config[section]:
-                # Get the value (deep copy for mutable values)
-                import copy
-                value = copy.deepcopy(self.config[section][key])
-            else:
-                value = resolved_default
-            
-            # Perform runtime validation for specific settings
-            try:
-                if section == 'network':
-                    if key == 'sampling' and value:
-                        # Validate sampling rate
-                        rate = value.get('rate', 0)
-                        if not 0 <= rate <= 1:
-                            self.logger.warning(
-                                "Invalid sampling rate, clamping to valid range",
-                                rate=rate
-                            )
-                            value['rate'] = max(0, min(1, rate))
-                            
-                    elif key == 'packet_queue_size' and value:
-                        # Ensure queue size is positive
-                        if value <= 0:
-                            self.logger.warning(
-                                "Invalid packet_queue_size, using default",
-                                value=value
-                            )
-                            value = 100000  # Default to a reasonable size
-                            
-                elif section == 'protocols' and key and value:
-                    # Ensure timeout values are reasonable
-                    if key.endswith('.timeout'):
-                        if value <= 0:
-                            self.logger.warning(
-                                f"Invalid protocol timeout for {key}, using default",
-                                value=value
-                            )
-                            value = 300  # Default timeout
-            except Exception as e:
-                self.logger.warning(
-                    f"Error validating configuration value for {section}.{key}",
-                    error=str(e)
-                )
-            
-            return value
+            with self._config_lock_context():
+                if section not in self.config:
+                    return default
+                
+                if key is None:
+                    return copy.deepcopy(self.config[section])
+                
+                value = self.config[section].get(key, default)
+                
+                # Validate the value if it exists
+                if value is not None and section in self.CONFIG_SCHEMA:
+                    section_schema = self.CONFIG_SCHEMA[section]
+                    if key in section_schema.values:
+                        self._validate_value(value, section_schema.values[key], f"{section}.{key}")
+                
+                return value
+                
+        except Exception as e:
+            self._handle_error(e, "get", "error", "validation_errors")
+            raise ConfigError(f"Error getting configuration value: {str(e)}")
     
     def is_feature_enabled(self, feature_name: str) -> bool:
         """
-        Check if a feature is enabled in the configuration.
+        Check if a feature is enabled.
         
         Args:
-            feature_name: Name of the feature to check
+            feature_name: Name of the feature
             
         Returns:
             True if the feature is enabled, False otherwise
         """
-        # Check cache
-        cache_key = f"features_{feature_name}_enabled"
-        if cache_key in self._cache:
-            return self._cache[cache_key]
-            
-        # Fall back to lock
-        with self._config_lock:
-            result = self.config.get('features', {}).get(feature_name, {}).get('enabled', False)
-            # Update cache
-            self._cache[cache_key] = result
-            return result
+        try:
+            return self.get('features', feature_name, {}).get('enabled', False)
+        except Exception as e:
+            self._handle_error(e, "is_feature_enabled", "error", "validation_errors")
+            return False
     
     def is_protocol_enabled(self, protocol_name: str) -> bool:
         """
-        Check if a protocol is enabled in the configuration.
+        Check if a protocol is enabled.
         
         Args:
-            protocol_name: Name of the protocol to check
+            protocol_name: Name of the protocol
             
         Returns:
             True if the protocol is enabled, False otherwise
         """
-        # Check cache
-        if protocol_name in self._cache.get('protocol_enabled', {}):
-            return self._cache['protocol_enabled'][protocol_name]
-            
-        # Fall back to lock
-        with self._config_lock:
-            result = self.config.get('protocols', {}).get(protocol_name, {}).get('enabled', False)
-            # Update cache
-            if 'protocol_enabled' not in self._cache:
-                self._cache['protocol_enabled'] = {}
-            self._cache['protocol_enabled'][protocol_name] = result
-            return result
+        try:
+            return self.get('protocols', protocol_name, {}).get('enabled', False)
+        except Exception as e:
+            self._handle_error(e, "is_protocol_enabled", "error", "validation_errors")
+            return False
     
     def get_protocol_timeout(self, protocol_name: str, default: int = 300) -> int:
         """
-        Get timeout value for a specific protocol.
+        Get the timeout for a protocol.
         
         Args:
-            protocol_name: Name of the protocol (e.g., 'tcp', 'udp')
-            default: Default timeout value if not found
+            protocol_name: Name of the protocol
+            default: Default timeout value
             
         Returns:
-            Timeout value in seconds
+            Protocol timeout in seconds
         """
-        # Known protocol defaults based on common practices
-        protocol_defaults = {
-            'tcp': 300,    # 5 minutes
-            'udp': 180,    # 3 minutes
-            'icmp': 60,    # 1 minute
-            'quic': 300,   # 5 minutes
-            'sctp': 300,   # 5 minutes
-            'dccp': 300,   # 5 minutes
-            'rsvp': 60,    # 1 minute
-            'unknown': default
-        }
-        
-        # Check cache first
-        if protocol_name in self._cache.get('protocol_timeout', {}):
-            return self._cache['protocol_timeout'][protocol_name]
-            
-        # Look up in configuration with lock
-        with self._config_lock:
-            # Look for protocol-specific timeout in config
-            timeout = self.config.get('protocols', {}).get(protocol_name, {}).get('timeout')
-            
-            if timeout is not None:
-                # Update cache
-                if 'protocol_timeout' not in self._cache:
-                    self._cache['protocol_timeout'] = {}
-                self._cache['protocol_timeout'][protocol_name] = timeout
-                return timeout
-                
-            # Return known default if available, otherwise user-provided default
-            return protocol_defaults.get(protocol_name, default)
-    
-    def get_log_level(self, component: Optional[str] = None) -> str:
-        """
-        Get the log level for a component.
-        
-        Args:
-            component: Component name
-            
-        Returns:
-            Log level string
-        """
-        # Check cache
-        cache_key = f"log_level_{component}" if component else "log_level_default"
-        if cache_key in self._cache:
-            return self._cache[cache_key]
-        
-        # Fall back to lock
-        with self._config_lock:
-            default_level = self.config.get('logging', {}).get('level', 'info')
-            if component is None:
-                self._cache["log_level_default"] = default_level
-                return default_level
-            
-            result = self.config.get('logging', {}).get('components', {}).get(component, default_level)
-            self._cache[cache_key] = result
-            return result
+        try:
+            return self.get('protocols', protocol_name, {}).get('timeout', default)
+        except Exception as e:
+            self._handle_error(e, "get_protocol_timeout", "error", "validation_errors")
+            return default
     
     def update_section(self, section: str, values: Dict[str, Any]) -> None:
         """
-        Update a section of the configuration.
+        Update a configuration section.
         
         Args:
             section: Section name
-            values: Dictionary of values to update
+            values: New values for the section
+            
+        Raises:
+            ConfigError: If the update fails
         """
-        with self._config_lock:
-            if section not in self.config:
-                self.config[section] = {}
+        try:
+            # Validate state
+            self._validate_state()
+            
+            with self._config_lock_context():
+                if section not in self.CONFIG_SCHEMA:
+                    raise ConfigSectionError(f"Invalid section: {section}")
                 
-            # Update the section with new values
-            for key, value in values.items():
-                self.config[section][key] = value
+                # Validate new values
+                section_schema = self.CONFIG_SCHEMA[section]
+                for key, value in values.items():
+                    if key in section_schema.values:
+                        self._validate_value(value, section_schema.values[key], f"{section}.{key}")
                 
-            # Update cache after modification
-            self._update_cache()
+                # Update section
+                if section not in self.config:
+                    self.config[section] = {}
+                self.config[section].update(values)
+                
+                # Update cache and state
+                self._update_cache()
+                self._update_state()
+                
+        except Exception as e:
+            self._handle_error(e, "update_section", "error", "validation_errors")
+            raise ConfigError(f"Failed to update configuration section: {str(e)}")
     
     def save_config(self, config_path: Optional[str] = None) -> None:
         """
         Save the current configuration to a file.
         
         Args:
-            config_path: Path to save the configuration file. If None, uses the current path.
+            config_path: Path to save the configuration to. If None, uses the current path.
+            
+        Raises:
+            ConfigIOError: If saving fails
         """
-        path = config_path if config_path else self.config_path
-        
-        with self._config_lock:
+        try:
+            # Validate state
+            self._validate_state()
+            
+            save_path = config_path if config_path else self.config_path
+            
             try:
-                with open(path, 'w') as f:
+                # Create directory if it doesn't exist
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                
+                with open(save_path, 'w') as f:
                     yaml.dump(self.config, f, default_flow_style=False)
+                
+                self.logger.info(f"Configuration saved successfully to {save_path}")
+                
             except Exception as e:
-                raise IOError(f"Failed to save configuration: {e}")
+                self._update_stats("io_errors")
+                raise ConfigIOError(f"Failed to save configuration: {str(e)}")
+            
+        except Exception as e:
+            self._handle_error(e, "save_config", "error", "io_errors")
+            raise ConfigIOError(f"Failed to save configuration: {str(e)}")

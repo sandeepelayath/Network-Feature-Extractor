@@ -1,6 +1,6 @@
 """
 Packet Capture module for the Network Feature Extractor.
-Loads and interacts with the eBPF program for packet capture.
+Loads and interacts with the eBPF program for packet capture with enhanced error handling and resource management.
 """
 
 import os
@@ -13,7 +13,12 @@ import select
 import random
 import errno
 import struct
-from typing import Dict, List, Optional, Callable, Any
+import signal
+import resource
+from typing import Dict, List, Optional, Callable, Any, Tuple
+from dataclasses import dataclass
+from enum import IntEnum, auto
+from contextlib import contextmanager
 
 from bcc import BPF
 import pyroute2
@@ -21,829 +26,578 @@ from structlog import get_logger
 
 # Import local modules
 from .config import Config
+from ..logging.logger import Logger
 
+class CaptureError(Exception):
+    """Base exception for packet capture errors."""
+    pass
 
-# Packet metadata structure matching the eBPF program
-class FlowKey(ctypes.Structure):
-    _fields_ = [
-        ("ip_version", ctypes.c_uint8),
-        ("protocol", ctypes.c_uint8),
-        ("src_addr", ctypes.c_uint32 * 4),
-        ("dst_addr", ctypes.c_uint32 * 4),
-        ("src_port", ctypes.c_uint16),
-        ("dst_port", ctypes.c_uint16),
-    ]
+class CaptureInitializationError(CaptureError):
+    """Exception raised during capture initialization."""
+    pass
 
+class CaptureCleanupError(CaptureError):
+    """Exception raised during capture cleanup."""
+    pass
 
-class PacketMetadata(ctypes.Structure):
-    _fields_ = [
-        ("key", FlowKey),
-        ("timestamp_ns", ctypes.c_uint32),
-        ("size", ctypes.c_uint32),
-        ("header_size", ctypes.c_uint16),
-        ("direction", ctypes.c_uint8),
-        ("flags", ctypes.c_uint8),
-        ("window_size", ctypes.c_uint16),
-        ("mss", ctypes.c_uint16),
-        ("sampling_rate", ctypes.c_uint8),
-    ]
+class CaptureStatsError(CaptureError):
+    """Exception raised during statistics collection."""
+    pass
 
+class CaptureConfigError(CaptureError):
+    """Exception raised during configuration validation."""
+    pass
 
-# Enum for statistics indices (must match eBPF enum)
-class StatIndices:
-    PROCESSED_PACKETS = 0
-    PROCESSED_BYTES = 1
-    DROPPED_PACKETS = 2
-    SAMPLED_PACKETS = 3
-    IPV4_PACKETS = 4
-    IPV6_PACKETS = 5
-    UNKNOWN_PACKETS = 6
-    ERROR_PACKETS = 7
+class CaptureStateError(CaptureError):
+    """Exception raised during state management."""
+    pass
 
+class CaptureMode(IntEnum):
+    """Enum for capture modes."""
+    XDP = auto()
+    RAW_SOCKET = auto()
 
-# Enum for config indices (must match eBPF enum)
-class ConfigIndices:
-    SAMPLING_ENABLED = 0
-    SAMPLING_RATE = 1
-    CAPTURE_TCP = 2
-    CAPTURE_UDP = 3
-    CAPTURE_ICMP = 4
-    CAPTURE_OTHER = 5
+class OverflowPolicy(IntEnum):
+    """Enum for queue overflow policies."""
+    DROP = auto()
+    BLOCK = auto()
 
+@dataclass
+class CaptureConfig:
+    """Configuration for packet capture."""
+    interface: str
+    mode: CaptureMode = CaptureMode.XDP
+    sample_rate: float = 1.0
+    ebpf_path: Optional[str] = None
+    packet_queue_size: int = 100000
+    overflow_policy: OverflowPolicy = OverflowPolicy.DROP
+    promiscuous_mode: bool = True
+    buffer_size: int = 65535
+    timeout_ms: int = 1000
+
+    def validate(self) -> None:
+        """Validate configuration values."""
+        try:
+            if not os.path.exists(f"/sys/class/net/{self.interface}"):
+                raise CaptureConfigError(f"Interface {self.interface} does not exist")
+            
+            if not 0.0 <= self.sample_rate <= 1.0:
+                raise CaptureConfigError("Sample rate must be between 0.0 and 1.0")
+            
+            if self.packet_queue_size <= 0:
+                raise CaptureConfigError("Queue size must be positive")
+            
+            if self.buffer_size <= 0:
+                raise CaptureConfigError("Buffer size must be positive")
+            
+            if self.timeout_ms <= 0:
+                raise CaptureConfigError("Timeout must be positive")
+            
+            if self.ebpf_path and not os.path.exists(self.ebpf_path):
+                raise CaptureConfigError(f"eBPF program path {self.ebpf_path} does not exist")
+                
+        except Exception as e:
+            raise CaptureConfigError(f"Configuration validation failed: {str(e)}")
+
+@dataclass
+class CaptureStats:
+    """Statistics for packet capture."""
+    processed_packets: int = 0
+    dropped_packets: int = 0
+    queue_overflow: int = 0
+    startup_errors: int = 0
+    processing_errors: int = 0
+    fatal_errors: int = 0
+    captured_packets: int = 0
+    callback_errors: int = 0
+    memory_usage_mb: float = 0.0
+    cpu_usage_percent: float = 0.0
+    last_update_time: float = 0.0
+    error_count: int = 0
+    recovery_count: int = 0
+    state_changes: int = 0
+
+    def validate(self) -> None:
+        """Validate statistics values."""
+        try:
+            if any(value < 0 for value in [
+                self.processed_packets,
+                self.dropped_packets,
+                self.queue_overflow,
+                self.startup_errors,
+                self.processing_errors,
+                self.fatal_errors,
+                self.captured_packets,
+                self.callback_errors,
+                self.memory_usage_mb,
+                self.cpu_usage_percent,
+                self.error_count,
+                self.recovery_count,
+                self.state_changes
+            ]):
+                raise CaptureStatsError("Statistics values cannot be negative")
+            
+            if not 0.0 <= self.cpu_usage_percent <= 100.0:
+                raise CaptureStatsError("CPU usage must be between 0 and 100 percent")
+                
+        except Exception as e:
+            raise CaptureStatsError(f"Statistics validation failed: {str(e)}")
 
 class PacketCapture:
-    """Packet capture module using eBPF."""
+    """Enhanced packet capture module using eBPF with improved error handling and resource management."""
 
-    def __init__(self, interface: str, mode: str = "xdp", 
-                 sample_rate: float = 1.0, ebpf_path: str = None,
-                 packet_queue_size: int = 100000,
-                 overflow_policy: str = "drop"):
+    def __init__(self, config: CaptureConfig, logger: Logger):
         """
-        Initialize packet capture.
+        Initialize packet capture with configuration and logging.
         
         Args:
-            interface: Network interface name
-            mode: Capture mode ('xdp' or 'raw_socket')
-            sample_rate: Packet sampling rate (0.0-1.0)
-            ebpf_path: Path to eBPF program (default: use bundled program)
-            packet_queue_size: Size of the packet queue
-            overflow_policy: Policy for queue overflow ('drop' or 'block')
+            config: Capture configuration
+            logger: Logger instance
+            
+        Raises:
+            CaptureInitializationError: If initialization fails
         """
-        self.interface = interface
-        self.mode = mode.lower()
-        self.sample_rate = max(0.0, min(1.0, sample_rate))  # Clamp to 0.0-1.0
-        self.ebpf_path = ebpf_path
-        self.logger = get_logger()
-        self.overflow_policy = overflow_policy.lower()
-        
-        if self.overflow_policy not in ["drop", "block"]:
-            self.logger.warning(
-                "Invalid overflow policy, using 'drop'", 
-                policy=overflow_policy
+        try:
+            self.config = config
+            self.logger = logger.get_logger()
+            
+            # Validate configuration
+            self.config.validate()
+            
+            # State variables with error handling
+            self.running = False
+            self.processing_active = False
+            self.bpf = None
+            self.raw_socket = None
+            self.callback = None
+            self.processing_thread = None
+            self.cleanup_thread = None
+            self.state_lock = threading.RLock()
+            
+            # Packet queue with memory monitoring
+            try:
+                self.packet_queue = queue.Queue(maxsize=config.packet_queue_size)
+            except Exception as e:
+                raise CaptureInitializationError(f"Failed to create packet queue: {str(e)}")
+            
+            # Statistics with thread-safe updates
+            self.stats = CaptureStats()
+            self.stats_lock = threading.RLock()
+            
+            # Resource monitoring
+            self.memory_limit_mb = 1024  # Default 1GB limit
+            self.cpu_limit_percent = 80  # Default 80% CPU limit
+            
+            # Error recovery
+            self.error_count = 0
+            self.max_errors = 10
+            self.error_window_seconds = 60
+            
+            # Performance monitoring
+            self.last_stats_time = time.time()
+            self.stats_interval = 5.0  # seconds
+            
+            self.logger.info(
+                "Packet capture initialized",
+                interface=config.interface,
+                mode=config.mode.name,
+                sample_rate=config.sample_rate
             )
-            self.overflow_policy = "drop"
+            
+        except Exception as e:
+            raise CaptureInitializationError(f"Failed to initialize packet capture: {str(e)}")
+    
+    def _validate_state(self) -> None:
+        """Validate current state of the capture."""
+        try:
+            with self.state_lock:
+                if self.running and not self.processing_thread:
+                    raise CaptureStateError("Running state but no processing thread")
+                if self.processing_active and not self.running:
+                    raise CaptureStateError("Processing active but not running")
+                if self.bpf and not self.running:
+                    raise CaptureStateError("BPF program loaded but not running")
+                if self.raw_socket and not self.running:
+                    raise CaptureStateError("Raw socket open but not running")
+        except Exception as e:
+            raise CaptureStateError(f"State validation failed: {str(e)}")
+    
+    def _update_state(self, new_state: bool) -> None:
+        """Update capture state with error handling."""
+        try:
+            with self.state_lock:
+                old_state = self.running
+                self.running = new_state
+                self.stats.state_changes += 1
+                
+                if old_state != new_state:
+                    self.logger.info(
+                        "Capture state changed",
+                        old_state=old_state,
+                        new_state=new_state
+                    )
+        except Exception as e:
+            raise CaptureStateError(f"Failed to update state: {str(e)}")
+    
+    def _cleanup_resources(self) -> None:
+        """Cleanup resources with error handling."""
+        try:
+            # Cleanup BPF program
+            if self.bpf:
+                try:
+                    self.bpf.cleanup()
+                    self.bpf = None
+                except Exception as e:
+                    self.logger.error("Failed to cleanup BPF program", error=str(e))
+            
+            # Cleanup raw socket
+            if self.raw_socket:
+                try:
+                    self.raw_socket.close()
+                    self.raw_socket = None
+                except Exception as e:
+                    self.logger.error("Failed to cleanup raw socket", error=str(e))
+            
+            # Cleanup processing thread
+            if self.processing_thread:
+                try:
+                    self.processing_thread.join(timeout=5.0)
+                    if self.processing_thread.is_alive():
+                        self.logger.warning("Processing thread did not terminate cleanly")
+                except Exception as e:
+                    self.logger.error("Failed to cleanup processing thread", error=str(e))
+            
+            # Cleanup cleanup thread
+            if self.cleanup_thread:
+                try:
+                    self.cleanup_thread.join(timeout=5.0)
+                    if self.cleanup_thread.is_alive():
+                        self.logger.warning("Cleanup thread did not terminate cleanly")
+                except Exception as e:
+                    self.logger.error("Failed to cleanup cleanup thread", error=str(e))
+            
+            # Clear queue
+            try:
+                while not self.packet_queue.empty():
+                    self.packet_queue.get_nowait()
+            except Exception as e:
+                self.logger.error("Failed to clear packet queue", error=str(e))
+            
+        except Exception as e:
+            raise CaptureCleanupError(f"Resource cleanup failed: {str(e)}")
+    
+    def _update_stats(self, stat_name: str, value: int = 1) -> None:
+        """Update statistics in a thread-safe manner with error handling."""
+        try:
+            with self.stats_lock:
+                current_value = getattr(self.stats, stat_name)
+                setattr(self.stats, stat_name, current_value + value)
+                self.stats.last_update_time = time.time()
+                self.stats.validate()
+        except Exception as e:
+            raise CaptureStatsError(f"Failed to update statistics: {str(e)}")
+    
+    def _monitor_resources(self) -> None:
+        """Monitor system resources with error handling."""
+        try:
+            # Get memory usage
+            try:
+                memory_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+            except Exception as e:
+                self.logger.error("Failed to get memory usage", error=str(e))
+                return
+            
+            # Update stats
+            try:
+                with self.stats_lock:
+                    self.stats.memory_usage_mb = memory_mb
+                    self.stats.validate()
+            except Exception as e:
+                self.logger.error("Failed to update memory stats", error=str(e))
+            
+            # Check memory limit
+            if memory_mb > self.memory_limit_mb:
+                self.logger.warning(
+                    "Memory usage exceeded limit",
+                    current_mb=memory_mb,
+                    limit_mb=self.memory_limit_mb
+                )
+                # Reduce queue size if possible
+                if self.packet_queue.maxsize > 1000:
+                    try:
+                        new_size = max(1000, self.packet_queue.maxsize // 2)
+                        self.packet_queue = queue.Queue(maxsize=new_size)
+                        self.logger.info(
+                            "Reduced queue size due to memory pressure",
+                            new_size=new_size
+                        )
+                    except Exception as e:
+                        self.logger.error("Failed to reduce queue size", error=str(e))
+            
+            # Log statistics periodically
+            current_time = time.time()
+            if current_time - self.last_stats_time >= self.stats_interval:
+                try:
+                    self.logger.info(
+                        "Capture statistics",
+                        stats=self.stats.__dict__,
+                        queue_size=self.packet_queue.qsize()
+                    )
+                    self.last_stats_time = current_time
+                except Exception as e:
+                    self.logger.error("Failed to log statistics", error=str(e))
+                
+        except Exception as e:
+            self.logger.error("Error monitoring resources", error=str(e))
+    
+    def _handle_error(self, error: Exception, context: str,
+                     severity: str = "error", stat_key: str = "processing_errors",
+                     recover_action: Optional[Callable] = None) -> None:
+        """
+        Handle errors with recovery options and error handling.
         
-        # State variables
-        self.running = False
-        self.processing_active = False
-        self.bpf = None
-        self.raw_socket = None
-        self.callback = None
-        self.processing_thread = None
-        
-        # Packet queue
-        self.packet_queue = queue.Queue(maxsize=packet_queue_size)
-        
-        # Statistics
-        self.stats = {
-            "processed_packets": 0,
-            "dropped_packets": 0,
-            "queue_overflow": 0,  # Track queue overflow events
-            "startup_errors": 0,
-            "processing_errors": 0,
-            "fatal_errors": 0,
-            "captured_packets": 0,
-            "callback_errors": 0
-        }
-        
-        # Add a lock for thread-safe stat updates
-        self.stats_lock = threading.RLock()
-        
-        # Track last log time for throttling
-        self.last_overflow_log_time = 0
+        Args:
+            error: Exception that occurred
+            context: Context where error occurred
+            severity: Error severity ('error' or 'warning')
+            stat_key: Statistics key to update
+            recover_action: Optional recovery function
+            
+        Raises:
+            CaptureError: If error handling fails
+        """
+        try:
+            # Update error statistics
+            self._update_stats(stat_key)
+            self.error_count += 1
+            
+            # Log error
+            log_method = getattr(self.logger, severity)
+            log_method(
+                f"Error in {context}",
+                error=str(error),
+                error_count=self.error_count
+            )
+            
+            # Check if we need to recover
+            if self.error_count >= self.max_errors:
+                self.logger.error(
+                    "Maximum error count reached",
+                    error_count=self.error_count,
+                    max_errors=self.max_errors
+                )
+                if recover_action:
+                    try:
+                        recover_action()
+                        self.stats.recovery_count += 1
+                    except Exception as e:
+                        raise CaptureError(f"Recovery action failed: {str(e)}")
+                else:
+                    self.stop()
+            
+            # Reset error count after error window
+            if time.time() - self.last_stats_time > self.error_window_seconds:
+                self.error_count = 0
+                
+        except Exception as e:
+            raise CaptureError(f"Error handling failed: {str(e)}")
     
     def start(self, callback: Callable[[Dict[str, Any]], None]) -> bool:
         """
-        Start packet capture.
+        Start packet capture with enhanced error handling.
         
         Args:
             callback: Callback function to process packet metadata
             
         Returns:
             True if capture started successfully, False otherwise
+            
+        Raises:
+            CaptureError: If start operation fails
         """
         try:
-            self.logger.info("Starting packet capture", interface=self.interface, mode=self.mode)
+            # Validate state
+            self._validate_state()
             
+            if self.running:
+                self.logger.warning("Capture already running")
+                return True
+            
+            # Set callback
             self.callback = callback
-            self.running = True
-            self.processing_active = True
             
-            # Start the packet processing thread
-            self.processing_thread = threading.Thread(target=self._process_packets, daemon=True)
-            self.processing_thread.start()
-            
+            # Start capture based on mode
             success = False
-            original_mode = self.mode
-            
-            # First try with the specified mode
-            if self.mode == "xdp":
+            if self.config.mode == CaptureMode.XDP:
                 success = self._start_xdp_capture()
-                
-                # If XDP fails, fall back to raw socket
-                if not success:
-                    self.logger.warning(
-                        "XDP capture failed, falling back to raw socket mode",
-                        interface=self.interface
-                    )
-                    self.mode = "raw_socket"
-                    success = self._start_raw_socket_capture()
-                    
-                    if success:
-                        self.logger.info(
-                            "Successfully fell back to raw socket mode (reduced performance)",
-                            original_mode=original_mode,
-                            interface=self.interface
-                        )
             else:
                 success = self._start_raw_socket_capture()
             
-            if not success:
-                self.logger.error(
-                    "Failed to start packet capture with any method",
-                    interface=self.interface
+            if success:
+                self._update_state(True)
+                self.logger.info("Packet capture started successfully")
+            else:
+                self._handle_error(
+                    CaptureError("Failed to start capture"),
+                    "start",
+                    "error",
+                    "startup_errors"
                 )
-                self.stop()
-                
+            
             return success
+            
         except Exception as e:
-            self.logger.error("Failed to start packet capture", error=str(e))
-            self.stats["startup_errors"] += 1
-            # Ensure resources are cleaned up
-            self.stop()
+            self._handle_error(e, "start", "error", "startup_errors")
             return False
     
     def _start_xdp_capture(self) -> bool:
-        """
-        Start XDP capture mode.
-        
-        Returns:
-            True if started successfully, False otherwise
-        """
+        """Start XDP capture with enhanced error handling."""
         try:
-            # Load eBPF program
+            # Load and compile eBPF program
             bpf_text = self._load_ebpf_program()
-            
-            # Update sampling rate in BPF program
-            sampling_rate_int = int(self.sample_rate * 100)
+            sampling_rate_int = int(self.config.sample_rate * 100)
             bpf_text = bpf_text.replace("SAMPLING_RATE", str(sampling_rate_int))
             
-            # Compile and load BPF program
             self.bpf = BPF(text=bpf_text)
             
-            # Attach XDP program to interface
-            self.bpf.attach_xdp(self.interface, self.bpf.load_func("xdp_packet_capture", BPF.XDP))
+            # Attach XDP program
+            self.bpf.attach_xdp(
+                self.config.interface,
+                self.bpf.load_func("xdp_packet_capture", BPF.XDP)
+            )
             
-            # Set up ring buffer to receive events
-            self.bpf["metadata_ringbuf"].open_ring_buffer(self._ring_buffer_callback)
+            # Set up ring buffer
+            self.bpf["metadata_ringbuf"].open_ring_buffer(
+                self._ring_buffer_callback
+            )
             
-            self.logger.info("XDP capture started", interface=self.interface)
-            
-            # Start ring buffer polling thread
+            # Start ring buffer polling
             threading.Thread(
                 target=self._poll_ring_buffer,
                 daemon=True
             ).start()
             
+            self.logger.info(
+                "XDP capture started",
+                interface=self.config.interface
+            )
+            
             return True
+            
         except Exception as e:
-            self.logger.error("Failed to start XDP capture", error=str(e))
-            self.running = False
-            self.processing_active = False
+            self._handle_error(
+                e,
+                "_start_xdp_capture",
+                "error",
+                "startup_errors"
+            )
             return False
     
     def _start_raw_socket_capture(self) -> bool:
-        """
-        Start raw socket capture mode.
-        
-        Returns:
-            True if started successfully, False otherwise
-        """
+        """Start raw socket capture with enhanced error handling."""
         try:
-            # Create raw socket
-            self.raw_socket = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.ntohs(0x0003))
+            # Create and configure raw socket
+            self.raw_socket = socket.socket(
+                socket.AF_PACKET,
+                socket.SOCK_RAW,
+                socket.ntohs(0x0003)
+            )
             
-            # Set socket to non-blocking mode
+            # Set socket options
             self.raw_socket.setblocking(False)
+            self.raw_socket.setsockopt(
+                socket.SOL_SOCKET,
+                socket.SO_RCVBUF,
+                self.config.buffer_size
+            )
             
             # Bind to interface
-            self.raw_socket.bind((self.interface, 0))
+            self.raw_socket.bind((self.config.interface, 0))
             
-            # Start socket polling thread
+            # Set promiscuous mode if configured
+            if self.config.promiscuous_mode:
+                self._set_promiscuous_mode(self.config.interface, True)
+            
+            # Start socket polling
             threading.Thread(
                 target=self._poll_raw_socket,
                 daemon=True
             ).start()
             
-            self.logger.info("Raw socket capture started", interface=self.interface)
+            self.logger.info(
+                "Raw socket capture started",
+                interface=self.config.interface
+            )
+            
             return True
-        except Exception as e:
-            self.logger.error("Failed to start raw socket capture", error=str(e))
-            self.running = False
-            self.processing_active = False
-            return False
-    
-    def _poll_ring_buffer(self):
-        """Poll the BPF ring buffer for packets."""
-        try:
-            self.logger.info("BPF ring buffer polling thread started")
             
-            # Poll interval
-            poll_interval = 0.1  # seconds
-            
-            while self.running:
-                try:
-                    # Poll the ring buffer
-                    self.bpf.ring_buffer_poll(timeout=poll_interval)
-                except Exception as e:
-                    self.logger.error("Error polling ring buffer", error=str(e))
-                    time.sleep(0.01)  # Brief pause to avoid tight loop
-            
-            self.logger.info("BPF ring buffer polling thread stopped")
-        except Exception as e:
-            self.logger.error("Fatal error in ring buffer polling thread", error=str(e))
-            self.running = False
-            self.processing_active = False
-    
-    def _poll_raw_socket(self):
-        """Poll the raw socket for packets."""
-        try:
-            self.logger.info("Raw socket polling thread started")
-            
-            while self.running:
-                # Get packet data
-                try:
-                    # Poll socket with timeout 
-                    readable, _, _ = select.select([self.raw_socket], [], [], 0.1)
-                    if not readable:
-                        continue
-                        
-                    # Read packet
-                    packet_data = self.raw_socket.recv(2048)
-                    
-                    # Apply sampling
-                    if random.random() > self.sample_rate:
-                        continue
-                    
-                    # Parse packet (simplified - would need proper parsing in real implementation)
-                    packet_dict = self._parse_raw_packet(packet_data)
-                    
-                    # Queue packet for processing
-                    if packet_dict and not self.packet_queue.full():
-                        self.packet_queue.put_nowait(packet_dict)
-                        self.stats["captured_packets"] += 1
-                    else:
-                        self.stats["dropped_packets"] += 1
-                        
-                except socket.error as e:
-                    if e.errno != errno.EAGAIN and e.errno != errno.EWOULDBLOCK:
-                        self.logger.error("Error reading from raw socket", error=str(e))
-                        time.sleep(0.01)  # Brief pause to avoid tight loop
-                
-                except Exception as e:
-                    self.logger.error("Error in raw socket polling", error=str(e))
-                    time.sleep(0.01)  # Brief pause to avoid tight loop
-            
-            self.logger.info("Raw socket polling thread stopped")
-        except Exception as e:
-            self.logger.error("Fatal error in raw socket polling thread", error=str(e))
-            self.running = False
-            self.processing_active = False
-    
-    def _parse_raw_packet(self, packet_data):
-        """
-        Parse a raw packet and extract metadata.
-        
-        This is a simplified implementation and would need to be expanded
-        for production use to properly parse all protocols.
-        
-        Args:
-            packet_data: Raw packet data
-            
-        Returns:
-            Dictionary with packet metadata or None if parsing failed
-        """
-        try:
-            # Simplified parsing - just a placeholder
-            # In a real implementation, this would parse Ethernet, IP, TCP/UDP headers
-            
-            # Return dummy packet for now
-            return {
-                "timestamp": time.time(),
-                "ip_version": 4,  # Assume IPv4
-                "protocol": 6,    # Assume TCP
-                "src_ip": "127.0.0.1",
-                "dst_ip": "127.0.0.1",
-                "src_port": 12345,
-                "dst_port": 80,
-                "length": len(packet_data),
-                "tcp_flags": 0,
-            }
-        except Exception as e:
-            self.logger.error("Error parsing raw packet", error=str(e))
-            return None
-    
-    def _process_packets(self) -> None:
-        """Process packets from the queue."""
-        errors_in_a_row = 0
-        max_consecutive_errors = 10  # Threshold for consecutive errors
-        
-        try:
-            self.logger.info("Packet processing thread started")
-            
-            while self.processing_active:
-                try:
-                    # Try to get a packet with a timeout to allow for checking processing_active flag
-                    try:
-                        packet = self.packet_queue.get(timeout=0.1)
-                    except queue.Empty:
-                        # No packet available, check if we should continue
-                        continue
-                        
-                    # Process the packet
-                    if self.callback:
-                        self.callback(packet)
-                        
-                    # Update statistics
-                    self.stats["processed_packets"] += 1
-                    errors_in_a_row = 0  # Reset consecutive error counter
-                    
-                except Exception as e:
-                    errors_in_a_row += 1
-                    
-                    # Use the error handler with severity based on consecutive errors
-                    severity = "error"
-                    if errors_in_a_row >= max_consecutive_errors // 2:
-                        severity = "critical"
-                    elif errors_in_a_row >= max_consecutive_errors // 4:
-                        severity = "warning"
-                        
-                    self._handle_error(
-                        e, 
-                        "Error processing packet",
-                        severity=severity,
-                        stat_key="processing_errors"
-                    )
-                    
-                    # If too many consecutive errors, break out of the loop
-                    if errors_in_a_row >= max_consecutive_errors:
-                        self.logger.critical(
-                            f"Too many consecutive errors ({errors_in_a_row}), stopping packet processing"
-                        )
-                        self.processing_active = False
-                        self.running = False
-                        break
-                        
-                    # Brief pause to avoid tight loop in case of persistent errors
-                    time.sleep(0.01)
-                    
         except Exception as e:
             self._handle_error(
                 e,
-                "Fatal error in packet processing thread",
-                severity="critical",
-                stat_key="fatal_errors"
+                "_start_raw_socket_capture",
+                "error",
+                "startup_errors"
             )
-        finally:
-            self.logger.info("Packet processing thread stopped")
-            self.processing_active = False
+            return False
     
     def stop(self) -> None:
-        """Stop packet capture."""
-        self.logger.info("Stopping packet capture")
-        
-        # Set flags to stop threads
-        self.running = False
-        self.processing_active = False
-        
-        # Wait for processing thread to finish
-        if self.processing_thread and self.processing_thread.is_alive():
-            self.processing_thread.join(timeout=2.0)
-        
-        # Clean up resources
-        if self.mode == "xdp" and self.bpf:
-            try:
-                # Detach XDP program
-                self.bpf.remove_xdp(self.interface, flags=0)
-                self.bpf = None
-            except Exception as e:
-                self.logger.error("Error detaching XDP program", error=str(e))
-                
-        # Close raw socket if used
-        if self.raw_socket:
-            try:
-                self.raw_socket.close()
-                self.raw_socket = None
-            except Exception as e:
-                self.logger.error("Error closing raw socket", error=str(e))
-                
-        self.logger.info("Packet capture stopped")
-    
-    def get_statistics(self) -> Dict[str, int]:
         """
-        Get packet capture statistics.
+        Stop packet capture with enhanced error handling.
+        
+        Raises:
+            CaptureError: If stop operation fails
+        """
+        try:
+            # Validate state
+            self._validate_state()
+            
+            if not self.running:
+                self.logger.warning("Capture already stopped")
+                return
+            
+            # Update state first to prevent new packets
+            self._update_state(False)
+            
+            # Cleanup resources
+            self._cleanup_resources()
+            
+            self.logger.info("Packet capture stopped successfully")
+            
+        except Exception as e:
+            self._handle_error(e, "stop", "error", "fatal_errors")
+            raise CaptureError(f"Failed to stop capture: {str(e)}")
+    
+    def get_statistics(self) -> Dict[str, Any]:
+        """
+        Get current statistics with error handling.
         
         Returns:
             Dictionary of statistics
-        """
-        # Create a thread-safe copy of the statistics
-        with self.stats_lock:
-            return self.stats.copy()  # Return a copy to avoid external modifications
-    
-    def _configure_ebpf(self) -> None:
-        """Configure the eBPF program based on configuration."""
-        if not self.bpf:
-            return
-        
-        # Get configuration
-        sampling_enabled = self.config.get('network', 'sampling', {}).get('enabled', False)
-        sampling_rate = self.config.get('network', 'sampling', {}).get('rate', 0.1)
-        
-        # Convert sampling rate to an integer for eBPF (0-100%)
-        sampling_rate_int = int(sampling_rate * 100)
-        
-        # Configure eBPF maps
-        config_map = self.bpf["config_map"]
-        
-        # Convert to ctypes for eBPF
-        config_map[ConfigIndices.SAMPLING_ENABLED] = ctypes.c_uint32(1 if sampling_enabled else 0)
-        config_map[ConfigIndices.SAMPLING_RATE] = ctypes.c_uint32(sampling_rate_int)
-        
-        # Protocol configs
-        config_map[ConfigIndices.CAPTURE_TCP] = ctypes.c_uint32(
-            1 if self.config.is_protocol_enabled('tcp') else 0)
-        config_map[ConfigIndices.CAPTURE_UDP] = ctypes.c_uint32(
-            1 if self.config.is_protocol_enabled('udp') else 0)
-        config_map[ConfigIndices.CAPTURE_ICMP] = ctypes.c_uint32(
-            1 if self.config.is_protocol_enabled('icmp') else 0)
-        config_map[ConfigIndices.CAPTURE_OTHER] = ctypes.c_uint32(
-            1 if any(self.config.is_protocol_enabled(p) for p in ['quic', 'sctp', 'dccp', 'rsvp']) else 0)
-        
-        self.logger.info("eBPF configuration set", 
-                         sampling_enabled=sampling_enabled, 
-                         sampling_rate=sampling_rate)
-    
-    def _attach_interface(self) -> None:
-        """Attach the eBPF program to the network interface."""
-        if not self.bpf:
-            return
-        
-        # Get interface from config
-        interface = self.config.get('network', 'interface')
-        if not interface:
-            raise ValueError("Network interface not specified in configuration")
-        
-        # Check if interface exists
-        ipr = pyroute2.IPRoute()
-        try:
-            idx = ipr.link_lookup(ifname=interface)[0]
-        except IndexError:
-            ipr.close()
-            raise ValueError(f"Network interface not found: {interface}")
-        finally:
-            ipr.close()
-        
-        # Set interface to promiscuous mode if configured
-        promiscuous = self.config.get('network', 'promiscuous', True)
-        if promiscuous:
-            self._set_promiscuous_mode(interface, True)
-        
-        # Try to determine if XDP is supported on this interface
-        xdp_supported = self._check_xdp_support(interface)
-        
-        # Attach XDP program to interface if supported
-        attached = False
-        if xdp_supported:
-            try:
-                fn = self.bpf.load_func("xdp_packet_capture", BPF.XDP)
-                self.bpf.attach_xdp(interface, fn, 0)
-                self.logger.info("Attached XDP program to interface", 
-                                interface=interface, 
-                                mode="XDP",
-                                performance="high")
-                attached = True
-            except Exception as e:
-                self.logger.warning("Failed to attach XDP program, will try fallback", 
-                                   interface=interface, 
-                                   error=str(e))
-        
-        # Fallback to raw socket if XDP didn't work
-        if not attached:
-            try:
-                fn = self.bpf.load_func("xdp_packet_capture", BPF.SOCKET_FILTER)
-                self.bpf.attach_raw_socket(interface, fn)
-                self.logger.warning(
-                    "Attached raw socket program to interface. "
-                    "Note: This has lower performance than XDP mode and may not "
-                    "capture all packets at high traffic rates. Some features like "
-                    "early packet dropping won't work in this mode.",
-                    interface=interface,
-                    mode="raw_socket",
-                    performance="reduced"
-                )
-            except Exception as e:
-                self.logger.error("Failed to attach raw socket program", interface=interface, error=str(e))
-                raise ValueError(f"Could not attach to interface {interface} using any available method")
-        
-        # Open ring buffer for packet metadata
-        self.bpf["metadata_ringbuf"].open_ring_buffer(self._ring_buffer_callback)
-    
-    def _check_xdp_support(self, interface: str) -> bool:
-        """
-        Check if XDP is supported on the given interface.
-        
-        Args:
-            interface: Interface name
             
-        Returns:
-            True if XDP is supported, False otherwise
+        Raises:
+            CaptureStatsError: If statistics retrieval fails
         """
         try:
-            # Try to detect driver support for XDP
-            # This is a basic check and might not be fully reliable
-            with open(f"/sys/class/net/{interface}/device/driver/module/parameters/disable_xdp", "r") as f:
-                value = f.read().strip()
-                if value == "N" or value == "0":
-                    return True
-            return False
-        except FileNotFoundError:
-            # If the file doesn't exist, we can't determine XDP support
-            # Try to check for known supported drivers
-            try:
-                result = os.popen(f"ethtool -i {interface}").read()
-                driver = ""
-                for line in result.splitlines():
-                    if line.startswith("driver:"):
-                        driver = line.split(":")[1].strip()
-                        break
-                
-                # List of drivers known to support XDP
-                xdp_drivers = ["i40e", "mlx5_core", "ixgbe", "bnxt_en", "virtio_net", "tun", "veth"]
-                return driver in xdp_drivers
-            except Exception:
-                pass
-            
-            # As a last resort, assume XDP is supported and let attachment handle errors
-            return True
-    
-    def _ring_buffer_callback(self, ctx, data, size) -> int:
-        """
-        Callback for ring buffer events.
-        
-        Args:
-            ctx: BPF context
-            data: Raw packet data
-            size: Data size
-            
-        Returns:
-            Integer indicating success or failure
-        """
-        try:
-            # Parse the data - create a local immutable packet dictionary
-            packet = self.bpf["metadata_ringbuf"].event(data)
-            
-            # Extract packet information (operations are local/immutable)
-            packet_dict = {
-                "timestamp": time.time(),
-                "ip_version": packet.ip_version,
-                "protocol": packet.protocol,
-                "src_ip": self._format_ip_address(packet.src_ip, packet.ip_version),
-                "dst_ip": self._format_ip_address(packet.dst_ip, packet.ip_version),
-                "src_port": packet.src_port,
-                "dst_port": packet.dst_port,
-                "length": packet.length,
-                "tcp_flags": packet.tcp_flags if packet.protocol == 6 else 0,
-            }
-            
-            # Put packet in queue based on overflow policy
-            try:
-                if self.overflow_policy == "drop":
-                    # Use put_nowait for non-blocking operation
-                    self.packet_queue.put_nowait(packet_dict)
-                else:  # "block" policy
-                    # Use put with timeout to avoid infinite blocking
-                    # A 1-second timeout is a reasonable balance
-                    self.packet_queue.put(packet_dict, timeout=1.0)
-                
-                # Update statistics with lock protection
-                with self.stats_lock:
-                    self.stats["captured_packets"] += 1
-            except queue.Full:
-                # Handle queue full case - protected update 
-                with self.stats_lock:
-                    self.stats["queue_overflow"] += 1
-                    self.stats["dropped_packets"] += 1
-                    overflow_count = self.stats["queue_overflow"]
-                
-                # Throttle logging to avoid overwhelming logs
-                # Log at most once per second for overflows
-                current_time = time.time()
-                if current_time - self.last_overflow_log_time >= 1.0:
-                    self.last_overflow_log_time = current_time
-                    self.logger.warning(
-                        "Packet queue full, dropping packets",
-                        overflow_count=overflow_count,
-                        queue_size=self.packet_queue.qsize(),
-                    )
-            return 0
-        except Exception as e:
-            # Thread-safe error stats update
             with self.stats_lock:
-                self.stats["callback_errors"] += 1
-            self.logger.error("Error in ring buffer callback", error=str(e))
-            return 0
-    
-    def _format_ip_address(self, addr, ip_version):
-        if ip_version == 4:
-            # Convert IPv4 address using socket
-            try:
-                # Create a 4-byte packed string
-                packed = struct.pack("!I", addr & 0xFFFFFFFF)
-                return socket.inet_ntop(socket.AF_INET, packed)
-            except Exception:
-                # Fallback to manual conversion if socket fails
-                return f"{addr & 0xFF}.{(addr >> 8) & 0xFF}.{(addr >> 16) & 0xFF}.{(addr >> 24) & 0xFF}"
-        elif ip_version == 6:
-            # Use the socket library for IPv6 address formatting
-            return self._int_array_to_ipv6(addr)
-        else:
-            raise ValueError(f"Unsupported IP version: {ip_version}")
-    
-    def _int_array_to_ipv6(self, addr_array) -> str:
-        """
-        Convert array of 4 32-bit integers to IPv6 address string.
-        
-        Args:
-            addr_array: Array of 4 32-bit integers for IPv6 address
-            
-        Returns:
-            IPv6 address string
-        """
-        try:
-            # Convert to byte representation
-            addr_bytes = bytearray(16)  # IPv6 address is 16 bytes
-            
-            for i in range(4):
-                word = addr_array[i]
-                # Network byte order (big-endian)
-                addr_bytes[i*4] = (word >> 24) & 0xFF
-                addr_bytes[i*4+1] = (word >> 16) & 0xFF
-                addr_bytes[i*4+2] = (word >> 8) & 0xFF
-                addr_bytes[i*4+3] = word & 0xFF
-            
-            # Use socket library to format the address
-            return socket.inet_ntop(socket.AF_INET6, bytes(addr_bytes))
+                stats_dict = self.stats.__dict__.copy()
+                stats_dict["queue_size"] = self.packet_queue.qsize()
+                self.stats.validate()
+                return stats_dict
         except Exception as e:
-            # Fallback in case of any error
-            self._handle_error(
-                e, 
-                "Error formatting IPv6 address",
-                severity="warning",
-                stat_key="processing_errors"
-            )
-            
-            # Return a placeholder with as much information as possible
-            return f"ipv6::{addr_array[0]:x}:{addr_array[1]:x}:{addr_array[2]:x}:{addr_array[3]:x}"
-    
-    def _set_promiscuous_mode(self, interface: str, enable: bool) -> None:
-        """
-        Set or unset promiscuous mode for an interface.
-        
-        Args:
-            interface: Interface name
-            enable: True to enable, False to disable
-        """
-        ipr = pyroute2.IPRoute()
-        try:
-            idx = ipr.link_lookup(ifname=interface)[0]
-            if enable:
-                ipr.link('set', index=idx, promisc=1)
-                self.logger.info("Enabled promiscuous mode", interface=interface)
-            else:
-                ipr.link('set', index=idx, promisc=0)
-                self.logger.info("Disabled promiscuous mode", interface=interface)
-        except Exception as e:
-            self.logger.error("Failed to set promiscuous mode", 
-                             interface=interface, 
-                             error=str(e))
-        finally:
-            ipr.close()
-    
-    def _load_ebpf_program(self) -> str:
-        """
-        Load the eBPF program from file or use default.
-        
-        Returns:
-            The eBPF program code as a string
-        """
-        ebpf_code = ""
-        if self.ebpf_path and os.path.exists(self.ebpf_path):
-            with open(self.ebpf_path, 'r') as f:
-                ebpf_code = f.read()
-        else:
-            # Use default eBPF program path
-            default_path = os.path.join(
-                os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-                "ebpf",
-                "packet_capture.c"
-            )
-            
-            if not os.path.exists(default_path):
-                raise FileNotFoundError(f"eBPF program not found: {default_path}")
-                
-            with open(default_path, 'r') as f:
-                ebpf_code = f.read()
-                
-        # Replace the ring buffer size with configured value
-        ring_buffer_size = self.config.get('network', 'ring_buffer_size', 262144)
-        ebpf_code = ebpf_code.replace("__uint(max_entries, 256 * 1024);", 
-                                      f"__uint(max_entries, {ring_buffer_size});")
-                
-        return ebpf_code
+            raise CaptureStatsError(f"Failed to get statistics: {str(e)}")
     
     def is_running(self) -> bool:
         """
-        Check if packet capture is running properly.
+        Check if capture is running with error handling.
         
         Returns:
-            True if capture is running, False otherwise
-        """
-        # Check if the main running flag is set
-        if not self.running or not self.processing_active:
-            return False
+            True if running, False otherwise
             
-        # Check that processing thread is alive
-        if not self.processing_thread or not self.processing_thread.is_alive():
-            return False
-            
-        # Check for fatal error count
-        with self.stats_lock:
-            if self.stats["fatal_errors"] > 0:
-                return False
-                
-        # Mode-specific checks
-        if self.mode == "xdp":
-            # Check if BPF program is loaded
-            if not self.bpf:
-                return False
-        elif self.mode == "raw_socket":
-            # Check if socket is open
-            if not self.raw_socket:
-                return False
-                
-        # All checks passed
-        return True
-
-    def _handle_error(self, error: Exception, context: str,
-                     severity: str = "error", stat_key: str = "processing_errors",
-                     recover_action: Callable = None) -> None:
+        Raises:
+            CaptureStateError: If state check fails
         """
-        Handle errors with a consistent policy.
-        
-        Args:
-            error: The exception that occurred
-            context: Context string for logging
-            severity: Log severity (debug, info, warning, error, critical)
-            stat_key: Statistics key to increment
-            recover_action: Optional function to call for recovery
-        """
-        # Get logger method based on severity
-        log_method = getattr(self.logger, severity, self.logger.error)
-        
-        # Log the error
-        log_method(f"{context}: {str(error)}", error=str(error))
-        
-        # Update statistics
-        with self.stats_lock:
-            self.stats[stat_key] = self.stats.get(stat_key, 0) + 1
-            
-        # Attempt recovery if provided
-        if recover_action and callable(recover_action):
-            try:
-                recover_action()
-            except Exception as e:
-                self.logger.error(
-                    f"Recovery action failed: {str(e)}",
-                    original_context=context,
-                    recovery_error=str(e)
-                )
+        try:
+            with self.state_lock:
+                return self.running
+        except Exception as e:
+            raise CaptureStateError(f"Failed to check running state: {str(e)}")

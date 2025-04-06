@@ -9,6 +9,40 @@ import logging
 from logging.handlers import RotatingFileHandler
 import structlog
 from typing import Dict, Any, Optional
+import threading
+import time
+from pathlib import Path
+
+
+class LoggerError(Exception):
+    """Base exception for logger errors."""
+    pass
+
+
+class LoggerInitializationError(LoggerError):
+    """Exception raised during logger initialization."""
+    pass
+
+
+class LoggerCleanupError(LoggerError):
+    """Exception raised during logger cleanup."""
+    pass
+
+
+class LoggerConfigError(LoggerError):
+    """Exception raised during logger configuration."""
+    pass
+
+
+class LoggerStateError(LoggerError):
+    """Exception raised during logger state management."""
+    pass
+
+
+class LoggerIOError(LoggerError):
+    """Exception raised during logger I/O operations."""
+    pass
+
 
 # Log levels mapping
 LOG_LEVELS = {
@@ -21,161 +55,98 @@ LOG_LEVELS = {
 
 
 class Logger:
-    """Logger manager for the Network Feature Extractor."""
+    """Logger class for handling application logging."""
     
     def __init__(self, config):
-        """
-        Initialize the logger.
-        
-        Args:
-            config: Configuration object containing logging settings
-        """
+        """Initialize the logger with configuration."""
         self.config = config
-        self.logger = self._setup_logger()
+        self.initialized = False
+        self.running = True
+        self.logger = None
+        self._setup_logger()
     
-    def _setup_logger(self) -> structlog.stdlib.BoundLogger:
-        """
-        Set up the logger based on configuration.
-        
-        Returns:
-            Configured logger instance
-        """
-        # Get logging configuration
-        log_format = self.config.get('logging', 'format', 'json')
-        log_level_str = self.config.get('logging', 'level', 'info')
-        log_file = self.config.get('logging', 'file', './logs/netflow.log')
-        max_size_mb = self.config.get('logging', 'max_size_mb', 100)
-        backup_count = self.config.get('logging', 'backup_count', 5)
-        
-        # Convert log level string to constant
-        log_level = LOG_LEVELS.get(log_level_str.lower(), logging.INFO)
-        
-        # Create log directory if it doesn't exist
-        os.makedirs(os.path.dirname(log_file), exist_ok=True)
-        
-        # Set up standard logger
-        root_logger = logging.getLogger()
-        root_logger.setLevel(log_level)
-        
-        # Clear any existing handlers
-        for handler in root_logger.handlers[:]:
-            root_logger.removeHandler(handler)
-        
-        # Create rotating file handler
-        file_handler = RotatingFileHandler(
-            log_file,
-            maxBytes=max_size_mb * 1024 * 1024,
-            backupCount=backup_count
-        )
-        file_handler.setLevel(log_level)
-        
-        # Create console handler
-        console_handler = logging.StreamHandler()
-        console_handler.setLevel(log_level)
-        
-        # Set up structlog processors based on format
-        if log_format.lower() == 'json':
-            structlog_processors = [
-                structlog.stdlib.filter_by_level,
-                structlog.stdlib.add_logger_name,
-                structlog.stdlib.add_log_level,
-                structlog.stdlib.PositionalArgumentsFormatter(),
-                structlog.processors.TimeStamper(fmt="iso"),
-                structlog.processors.StackInfoRenderer(),
-                structlog.processors.format_exc_info,
-                structlog.processors.UnicodeDecoder(),
-                structlog.processors.JSONRenderer()
-            ]
+    def _setup_logger(self):
+        """Set up the logger with handlers and formatters."""
+        try:
+            # Get configuration values
+            log_file = self.config.get('logging', 'file')
+            max_size = self.config.get('logging', 'max_size_mb', 1) * 1024 * 1024  # Convert MB to bytes
+            backup_count = self.config.get('logging', 'backup_count', 3)
             
-            # JSON formatter for standard logging
-            class JsonFormatter(logging.Formatter):
-                def format(self, record):
-                    log_record = {
-                        'timestamp': self.formatTime(record, "%Y-%m-%dT%H:%M:%S.%fZ"),
-                        'level': record.levelname,
-                        'logger': record.name,
-                        'message': record.getMessage()
-                    }
-                    if record.exc_info:
-                        log_record['exception'] = self.formatException(record.exc_info)
-                    return json.dumps(log_record)
+            # Create log directory if it doesn't exist
+            log_dir = Path(log_file).parent
+            log_dir.mkdir(parents=True, exist_ok=True)
             
-            formatter = JsonFormatter()
+            # Create logger
+            self.logger = logging.getLogger(__name__)
+            self.logger.setLevel(logging.INFO)
             
-        else:  # Text format
-            structlog_processors = [
-                structlog.stdlib.filter_by_level,
-                structlog.stdlib.add_logger_name,
-                structlog.stdlib.add_log_level,
-                structlog.stdlib.PositionalArgumentsFormatter(),
-                structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M:%S"),
-                structlog.processors.StackInfoRenderer(),
-                structlog.processors.format_exc_info,
-                structlog.processors.UnicodeDecoder(),
-                structlog.dev.ConsoleRenderer()
-            ]
+            # Create formatter
+            formatter = logging.Formatter(
+                '{"level": "%(levelname)s", "message": "%(message)s", "timestamp": "%(asctime)s.%(msecs)03dZ"%(extra_fields)s}',
+                datefmt='%Y-%m-%dT%H:%M:%S'
+            )
             
-            formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(name)s: %(message)s')
-        
-        # Apply formatter to handlers
-        file_handler.setFormatter(formatter)
-        console_handler.setFormatter(formatter)
-        
-        # Add handlers to root logger
-        root_logger.addHandler(file_handler)
-        root_logger.addHandler(console_handler)
-        
-        # Configure structlog
-        structlog.configure(
-            processors=structlog_processors,
-            context_class=dict,
-            logger_factory=structlog.stdlib.LoggerFactory(),
-            wrapper_class=structlog.stdlib.BoundLogger,
-            cache_logger_on_first_use=True,
-        )
-        
-        # Return a logger instance for the application
-        return structlog.get_logger("network-feature-extractor")
+            # Add file handler
+            file_handler = logging.handlers.RotatingFileHandler(
+                log_file,
+                maxBytes=max_size,
+                backupCount=backup_count,
+                encoding='utf-8'
+            )
+            file_handler.setFormatter(formatter)
+            self.logger.addHandler(file_handler)
+            
+            # Add console handler for initialization message only
+            console_handler = logging.StreamHandler()
+            console_handler.setFormatter(formatter)
+            self.logger.addHandler(console_handler)
+            
+            # Log initialization message
+            self.logger.info('Logger initialized successfully')
+            
+            # Remove console handler after initialization
+            self.logger.removeHandler(console_handler)
+            
+            self.initialized = True
+            
+        except Exception as e:
+            raise LoggerInitializationError(f"Failed to initialize logger: {str(e)}")
     
-    def get_logger(self, component: Optional[str] = None) -> structlog.stdlib.BoundLogger:
-        """
-        Get a logger for a specific component.
+    def log(self, level, message, **kwargs):
+        """Log a message with the specified level and additional fields."""
+        if not self.initialized or not self.running:
+            raise LoggerError("Logger not initialized or not running")
         
-        Args:
-            component: Component name
+        try:
+            # Get the appropriate logging method
+            log_method = getattr(self.logger, level.lower())
             
-        Returns:
-            Logger instance bound with component context
-        """
-        if component:
-            # Get component-specific log level
-            log_level_str = self.config.get_log_level(component)
-            log_level = LOG_LEVELS.get(log_level_str.lower(), logging.INFO)
+            # Format extra fields for JSON output
+            extra_fields = ''
+            if kwargs:
+                extra_fields = ', ' + ', '.join(f'"{k}": {json.dumps(v)}' for k, v in kwargs.items())
             
-            # Create a component-specific logger with the same handlers
-            logger = self.logger.bind(component=component)
+            # Create a custom formatter for this log entry
+            formatter = logging.Formatter(
+                '{"level": "%(levelname)s", "message": "%(message)s", "timestamp": "%(asctime)s.%(msecs)03dZ"' + extra_fields + '}',
+                datefmt='%Y-%m-%dT%H:%M:%S'
+            )
             
-            # Set the component level (affects only structlog's filter_by_level processor)
-            logger = logger.new(level=log_level)
+            # Update formatter for all handlers
+            for handler in self.logger.handlers:
+                handler.setFormatter(formatter)
             
-            return logger
-        
-        return self.logger
+            # Log the message
+            log_method(message)
+            
+        except Exception as e:
+            raise LoggerError(f"Failed to log message: {str(e)}")
     
-    def update_log_level(self, component: Optional[str] = None) -> None:
-        """
-        Update the log level for a component based on configuration.
-        
-        Args:
-            component: Component name
-        """
-        # This could be used to dynamically update log levels at runtime
-        log_level_str = self.config.get_log_level(component)
-        log_level = LOG_LEVELS.get(log_level_str.lower(), logging.INFO)
-        
-        if component:
-            # Get the logger for the specific component
-            logging.getLogger(f"network-feature-extractor.{component}").setLevel(log_level)
-        else:
-            # Update the root logger level
-            logging.getLogger().setLevel(log_level)
+    def cleanup(self):
+        """Clean up logger resources."""
+        if self.logger:
+            for handler in self.logger.handlers:
+                handler.close()
+                self.logger.removeHandler(handler)
+        self.running = False
